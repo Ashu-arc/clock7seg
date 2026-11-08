@@ -55,11 +55,27 @@ jobs:
           cp .pio/build/clock7seg_esp8266/firmware.bin    ../out/Clock7Seg_ESP8266_4MB.bin
           cp .pio/build/clock7seg_esp8266_1m/firmware.bin ../out/Clock7Seg_ESP8266_1MB.bin
           cp .pio/build/clock7seg_esp32/firmware.bin      ../out/Clock7Seg_ESP32_update.bin
+          ls -la ../out
+
+      - name: Make ESP32 first-install file (optional)
+        continue-on-error: true
+        run: |
+          cd wled
           B=.pio/build/clock7seg_esp32
           BOOT=$(find ~/.platformio/packages -name boot_app0.bin | head -1)
-          esptool.py --chip esp32 merge_bin -o ../out/Clock7Seg_ESP32_first_install.bin \
-            --flash_mode dio --flash_size 4MB \
-            0x1000 $B/bootloader.bin 0x8000 $B/partitions.bin 0xe000 "$BOOT" 0x10000 $B/firmware.bin
+          LOADER=$(find ~/.platformio/packages -name 'bootloader_dio_40m.bin' | head -1)
+          [ -z "$LOADER" ] && LOADER=$(find ~/.platformio/packages -name 'bootloader_*dio*40m*.bin' | head -1)
+          PART=$B/partitions.bin
+          if [ ! -f "$PART" ]; then
+            GEN=$(find ~/.platformio/packages -name gen_esp32part.py | head -1)
+            python "$GEN" tools/WLED_ESP32_4MB_1MB_FS.csv /tmp/partitions.bin
+            PART=/tmp/partitions.bin
+          fi
+          echo "bootloader=$LOADER partitions=$PART boot_app0=$BOOT"
+          esptool --chip esp32 merge-bin -o ../out/Clock7Seg_ESP32_first_install.bin \
+            --flash-mode dio --flash-size 4MB \
+            0x1000 "$LOADER" 0x8000 "$PART" 0xe000 "$BOOT" 0x10000 $B/firmware.bin
+          ls -la ../out
 
       - name: Publish release (download links work on phone)
         uses: softprops/action-gh-release@v2
