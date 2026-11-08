@@ -199,10 +199,7 @@ class UsermodClock7Seg : public Usermod {
         }
         if (ok) {
           if (!sameAsGlobal) {
-            #ifdef ARDUINO_ARCH_ESP32
-            Wire.end();
-            #endif
-            Wire.begin(rtcSda, rtcScl);
+            Wire.begin(rtcSda, rtcScl);   // (old ESP32 core 1.0.x has no Wire.end())
           }
           rtcReady = rtcProbe();
           if (rtcReady) rtcLoadToWled();
