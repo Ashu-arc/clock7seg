@@ -27,6 +27,9 @@ jobs:
           cp -r mine/usermods/clock_7seg_pro wled/usermods/
           cp mine/platformio_override.ini wled/platformio_override.ini
           cd wled
+          # Fix: library version pin that no longer resolves (use the exact tag instead)
+          sed -i 's|ESPAsyncWebServer.git *@ *2.2.1|ESPAsyncWebServer.git#v2.2.1|' platformio.ini
+          grep -n "ESPAsyncWebServer" platformio.ini
           sed -i '0,/#include "wled.h"/s//#include "wled.h"\n#ifdef USERMOD_CLOCK7SEG\n  #include "..\/usermods\/clock_7seg_pro\/usermod_clock_7seg_pro.h"\n#endif/' wled00/usermods_list.cpp
           sed -i '/^void registerUsermods()/{n;s/{/{\n  #ifdef USERMOD_CLOCK7SEG\n  usermods.add(new UsermodClock7Seg());\n  #endif/}' wled00/usermods_list.cpp
           grep -n "CLOCK7SEG\|Clock7Seg" wled00/usermods_list.cpp
