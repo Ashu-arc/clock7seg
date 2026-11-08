@@ -1,0 +1,66 @@
+name: Build Clock7Seg firmware
+
+on:
+  workflow_dispatch:
+    inputs:
+      wled_tag:
+        description: "WLED version tag to build on (v0.14.4 = tested API)"
+        default: "v0.14.4"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: mine
+
+      - name: Get WLED source
+        run: git clone --depth 1 --branch "${{ github.event.inputs.wled_tag }}" https://github.com/wled/WLED.git wled || git clone --depth 1 --branch "${{ github.event.inputs.wled_tag }}" https://github.com/Aircoookie/WLED.git wled
+
+      - name: Add clock usermod
+        run: |
+          cp -r mine/usermods/clock_7seg_pro wled/usermods/
+          cp mine/platformio_override.ini wled/platformio_override.ini
+          cd wled
+          sed -i '0,/#include "wled.h"/s//#include "wled.h"\n#ifdef USERMOD_CLOCK7SEG\n  #include "..\/usermods\/clock_7seg_pro\/usermod_clock_7seg_pro.h"\n#endif/' wled00/usermods_list.cpp
+          sed -i '/^void registerUsermods()/{n;s/{/{\n  #ifdef USERMOD_CLOCK7SEG\n  usermods.add(new UsermodClock7Seg());\n  #endif/}' wled00/usermods_list.cpp
+          grep -n "CLOCK7SEG\|Clock7Seg" wled00/usermods_list.cpp
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install tools
+        run: pip install platformio esptool && cd wled && npm ci
+
+      - name: Build
+        run: |
+          cd wled
+          pio run -e clock7seg_esp8266 -e clock7seg_esp8266_1m -e clock7seg_esp32
+
+      - name: Collect .bin files
+        run: |
+          mkdir out
+          cd wled
+          cp .pio/build/clock7seg_esp8266/firmware.bin    ../out/Clock7Seg_ESP8266_4MB.bin
+          cp .pio/build/clock7seg_esp8266_1m/firmware.bin ../out/Clock7Seg_ESP8266_1MB.bin
+          cp .pio/build/clock7seg_esp32/firmware.bin      ../out/Clock7Seg_ESP32_update.bin
+          B=.pio/build/clock7seg_esp32
+          BOOT=$(find ~/.platformio/packages -name boot_app0.bin | head -1)
+          esptool.py --chip esp32 merge_bin -o ../out/Clock7Seg_ESP32_first_install.bin \
+            --flash_mode dio --flash_size 4MB \
+            0x1000 $B/bootloader.bin 0x8000 $B/partitions.bin 0xe000 "$BOOT" 0x10000 $B/firmware.bin
+
+      - name: Publish release (download links work on phone)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: clock7seg-${{ github.run_number }}
+          name: Clock7Seg firmware ${{ github.run_number }} (WLED ${{ github.event.inputs.wled_tag }})
+          files: out/*.bin
