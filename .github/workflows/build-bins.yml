@@ -1,11 +1,11 @@
-name: Build Clock7Seg firmware
+name: Build Ashish Automation clock firmware
 
 on:
   workflow_dispatch:
     inputs:
       wled_tag:
-        description: "WLED version tag to build on (v0.14.4 = tested API)"
-        default: "v0.14.4"
+        description: "WLED version tag (v0.15.0 = tested API)"
+        default: "v0.15.0"
         required: true
 
 permissions:
@@ -22,49 +22,63 @@ jobs:
       - name: Get WLED source
         run: git clone --depth 1 --branch "${{ github.event.inputs.wled_tag }}" https://github.com/wled/WLED.git wled || git clone --depth 1 --branch "${{ github.event.inputs.wled_tag }}" https://github.com/Aircoookie/WLED.git wled
 
-      - name: Add clock usermod
+      - name: Add clock usermod and welcome page name
         run: |
-          cp -r mine/usermods/clock_7seg_pro wled/usermods/
+          cp -r mine/usermods/ashish_clock_7seg wled/usermods/
           cp mine/platformio_override.ini wled/platformio_override.ini
           cd wled
-          # Fix: library version pin that no longer resolves (use the exact tag instead)
-          sed -i 's|ESPAsyncWebServer.git *@ *2.2.1|ESPAsyncWebServer.git#v2.2.1|' platformio.ini
-          grep -n "ESPAsyncWebServer" platformio.ini
-          sed -i '0,/#include "wled.h"/s//#include "wled.h"\n#ifdef USERMOD_CLOCK7SEG\n  #include "..\/usermods\/clock_7seg_pro\/usermod_clock_7seg_pro.h"\n#endif/' wled00/usermods_list.cpp
-          sed -i '/^void registerUsermods()/{n;s/{/{\n  #ifdef USERMOD_CLOCK7SEG\n  usermods.add(new UsermodClock7Seg());\n  #endif/}' wled00/usermods_list.cpp
-          grep -n "CLOCK7SEG\|Clock7Seg" wled00/usermods_list.cpp
+          sed -i '0,/#include "wled.h"/s//#include "wled.h"\n#ifdef USERMOD_ASHISH_CLOCK7SEG\n  #include "..\/usermods\/ashish_clock_7seg\/usermod_ashish_clock_7seg.h"\n#endif/' wled00/usermods_list.cpp
+          sed -i '/^void registerUsermods()/{n;s/{/{\n  #ifdef USERMOD_ASHISH_CLOCK7SEG\n  UsermodManager::add(new UsermodAshishClock7Seg());\n  #endif/}' wled00/usermods_list.cpp
+          grep -n "ASHISH\|Ashish" wled00/usermods_list.cpp
+          python3 - <<'PY'
+          p = "wled00/data/welcome.htm"
+          s = open(p, encoding="utf-8").read()
+          old = "<h1>Welcome to WLED!</h1>"
+          new = old + '\n\t\t\t<h2 style="margin:0 0 14px 0;color:#ffb300;letter-spacing:1px"><b>Ashish Automation</b></h2>'
+          assert old in s, "welcome.htm line not found"
+          open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
+          print("welcome page patched")
+          PY
+          grep -n "Ashish" wled00/data/welcome.htm
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 18
+          node-version: 20
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
       - name: Install tools
         run: pip install platformio esptool && cd wled && npm ci
 
-      - name: Build
+      - name: Build ESP8266 (4MB) and ESP32
         run: |
           cd wled
-          pio run -e clock7seg_esp8266 -e clock7seg_esp8266_1m -e clock7seg_esp32
+          pio run -e ashish_esp8266 -e ashish_esp32
+
+      - name: Build ESP8266 1MB (optional)
+        continue-on-error: true
+        run: |
+          cd wled
+          pio run -e ashish_esp8266_1m
 
       - name: Collect .bin files
         run: |
           mkdir out
           cd wled
-          cp .pio/build/clock7seg_esp8266/firmware.bin    ../out/Clock7Seg_ESP8266_4MB.bin
-          cp .pio/build/clock7seg_esp8266_1m/firmware.bin ../out/Clock7Seg_ESP8266_1MB.bin
-          cp .pio/build/clock7seg_esp32/firmware.bin      ../out/Clock7Seg_ESP32_update.bin
+          cp .pio/build/ashish_esp8266/firmware.bin ../out/Ashish_Clock_ESP8266_4MB.bin
+          cp .pio/build/ashish_esp32/firmware.bin   ../out/Ashish_Clock_ESP32_update.bin
+          [ -f .pio/build/ashish_esp8266_1m/firmware.bin ] && cp .pio/build/ashish_esp8266_1m/firmware.bin ../out/Ashish_Clock_ESP8266_1MB_cable_only.bin || echo "1MB build skipped"
           ls -la ../out
 
       - name: Make ESP32 first-install file (optional)
         continue-on-error: true
         run: |
           cd wled
-          B=.pio/build/clock7seg_esp32
+          B=.pio/build/ashish_esp32
           BOOT=$(find ~/.platformio/packages -name boot_app0.bin | head -1)
-          LOADER=$(find ~/.platformio/packages -name 'bootloader_dio_40m.bin' | head -1)
-          [ -z "$LOADER" ] && LOADER=$(find ~/.platformio/packages -name 'bootloader_*dio*40m*.bin' | head -1)
+          LOADER=$B/bootloader.bin
+          [ -f "$LOADER" ] || LOADER=$(find ~/.platformio/packages -name 'bootloader_dio_40m.bin' | head -1)
+          [ -f "$LOADER" ] || LOADER=$(find ~/.platformio/packages -name 'bootloader_*dio*40m*.bin' | head -1)
           PART=$B/partitions.bin
           if [ ! -f "$PART" ]; then
             GEN=$(find ~/.platformio/packages -name gen_esp32part.py | head -1)
@@ -72,7 +86,7 @@ jobs:
             PART=/tmp/partitions.bin
           fi
           echo "bootloader=$LOADER partitions=$PART boot_app0=$BOOT"
-          esptool --chip esp32 merge-bin -o ../out/Clock7Seg_ESP32_first_install.bin \
+          esptool --chip esp32 merge-bin -o ../out/Ashish_Clock_ESP32_first_install.bin \
             --flash-mode dio --flash-size 4MB \
             0x1000 "$LOADER" 0x8000 "$PART" 0xe000 "$BOOT" 0x10000 $B/firmware.bin
           ls -la ../out
@@ -80,6 +94,6 @@ jobs:
       - name: Publish release (download links work on phone)
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: clock7seg-${{ github.run_number }}
-          name: Clock7Seg firmware ${{ github.run_number }} (WLED ${{ github.event.inputs.wled_tag }})
+          tag_name: ashish-clock-${{ github.run_number }}
+          name: Ashish Automation clock firmware ${{ github.run_number }} (WLED ${{ github.event.inputs.wled_tag }})
           files: out/*.bin
