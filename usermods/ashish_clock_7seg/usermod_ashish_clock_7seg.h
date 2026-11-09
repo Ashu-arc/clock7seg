@@ -3,9 +3,10 @@
  * Ashish Automation - 7 segment pixel-LED clock usermod for WLED 0.15.0 (ESP8266 + ESP32)
  *
  * LED chain order (one data line):
- *   [digit 1]..[digit N] [colon LEDs] [weekday LEDs SUN..SAT]
+ *   HH -> colon -> MM -> colon -> SS -> weekdays SUN..SAT      (HH:MM:SS)
+ *   HH -> colon -> MM -> weekdays SUN..SAT                      (HH:MM)
  *   digit = 7 segments (physical order selectable, default F-A-B-C-D-E-G), 1..10 LEDs per segment
- *   N = 6 (HH:MM:SS) or 4 (HH:MM)
+ *   colon = 1..6 LEDs per colon
  *
  * The usermod only switches LEDs OFF (or recolours lit ones if you set a colour).
  * Use the "Solid" effect on the main page for a plain clock.
@@ -33,13 +34,14 @@ class UsermodAshishClock7Seg : public Usermod {
     uint8_t hourFormat   = 0;      // 0 = 24H, 1 = 12H
     bool    leadingZero  = true;
     bool    colonBlink   = true;
-    bool    weekdaysOn   = true;
+    uint8_t weekdayMode  = 1;      // 0 off, 1 today only, 2 all on (today highlighted)
+    bool    startupTest  = false;  // lamp test for 3 s after power on
 
     uint16_t firstLed    = 0;
     uint8_t segPreset    = 1;      // 0 = custom text, 1..4 presets
     char    segCustom[9] = "FABCDEG";
     uint8_t ledsPerSeg   = 1;      // 1..10
-    uint8_t colonLeds    = 2;      // 1..6
+    uint8_t colonLeds    = 2;      // 1..6 LEDs PER colon
     uint8_t ledsPerDay   = 1;      // 1..5
 
     bool    dateShow     = false;
@@ -53,7 +55,8 @@ class UsermodAshishClock7Seg : public Usermod {
     uint8_t secTemp      = 2;
     int8_t  tempOffset   = 0;      // degrees C added to reading
 
-    char    wdHex[10]    = "";     // empty = use effect colour
+    char    wdHex[10]    = "";     // today colour (empty = effect colour; mode 2 default red)
+    char    otherHex[10] = "";     // other days colour in mode 2 (empty = effect colour)
     char    colonHex[10] = "";
     char    dateHex[10]  = "";
     char    tempHex[10]  = "";
@@ -76,6 +79,8 @@ class UsermodAshishClock7Seg : public Usermod {
     bool    nightOn      = false;
     uint8_t nightStart   = 23;
     uint8_t nightEnd     = 6;
+    uint8_t nightAction  = 0;      // 0 display off, 1 dim
+    uint8_t nightDim     = 20;     // percent brightness when dimmed
 
     bool    autoBri      = false;
     int8_t  ldrPin       = C7_DEF_LDR;
@@ -113,6 +118,7 @@ class UsermodAshishClock7Seg : public Usermod {
     unsigned long ringEnd = 0, chimeBeepStart = 0, beepUntil = 0, peekStart = 0;
     uint32_t snoozeAt = 0, alarmKey = 0, chimeKey = 0;
     bool     btnDown = false;
+    unsigned long bootTestUntil = 0;
     unsigned long btnSince = 0, btnChange = 0;
 
     // bit0=A ... bit6=G ; 0-9 digits, 10 blank, 11 dash, 12 degree, 13 C, 14 F
@@ -122,9 +128,12 @@ class UsermodAshishClock7Seg : public Usermod {
 
     // ---------- helpers ----------
     uint8_t digitCount() const { return mode == 0 ? 6 : 4; }
-    uint16_t colonBase() const { return firstLed + (uint16_t)digitCount() * 7 * ledsPerSeg; }
-    uint16_t dayBase()   const { return colonBase() + colonLeds; }
-    uint16_t ledsNeeded() const { return (uint16_t)digitCount() * 7 * ledsPerSeg + colonLeds + 7 * ledsPerDay; }
+    uint8_t colonCount() const { return mode == 0 ? 2 : 1; }
+    // chain: HH colon MM colon SS weekdays  -> a colon sits after every pair of digits
+    uint16_t digitBase(uint8_t d) const { return firstLed + (uint16_t)d * 7 * ledsPerSeg + (uint16_t)(d / 2) * colonLeds; }
+    uint16_t colonBaseAt(uint8_t k) const { return firstLed + (uint16_t)(k + 1) * 2 * 7 * ledsPerSeg + (uint16_t)k * colonLeds; }
+    uint16_t dayBase()   const { return firstLed + (uint16_t)digitCount() * 7 * ledsPerSeg + (uint16_t)colonCount() * colonLeds; }
+    uint16_t ledsNeeded() const { return (uint16_t)digitCount() * 7 * ledsPerSeg + (uint16_t)colonCount() * colonLeds + 7 * ledsPerDay; }
 
     static uint8_t bcd2dec(uint8_t v) { return (v >> 4) * 10 + (v & 0x0F); }
     static uint8_t dec2bcd(uint8_t v) { return ((v / 10) << 4) | (v % 10); }
@@ -400,10 +409,12 @@ class UsermodAshishClock7Seg : public Usermod {
       uint8_t wd = weekday(t);                                // 1 = Sunday
       if (wd >= 1 && wd <= 7) wdMask = 1 << (wd - 1);
 
-      if (testMode) {
+      uint8_t tm = testMode;
+      if (!tm && bootTestUntil) { if ((long)(bootTestUntil - millis()) > 0) tm = 1; else bootTestUntil = 0; }
+      if (tm) {
         uint8_t step = (millis() / 800) % 7;
-        if (testMode == 1) { for (uint8_t i = 0; i < n; i++) patt[i] = 0x7F; colonOn = true; wdMask = 0x7F; }
-        else if (testMode == 2) { for (uint8_t i = 0; i < n; i++) patt[i] = 1 << step; wdMask = 1 << step; }
+        if (tm == 1) { for (uint8_t i = 0; i < n; i++) patt[i] = 0x7F; colonOn = true; wdMask = 0x7F; }
+        else if (tm == 2) { for (uint8_t i = 0; i < n; i++) patt[i] = 1 << step; wdMask = 1 << step; }
         else { uint8_t d = (millis() / 1000) % 10; for (uint8_t i = 0; i < n; i++) patt[i] = PAT[d]; colonOn = true; }
         return 0;
       }
@@ -444,7 +455,7 @@ class UsermodAshishClock7Seg : public Usermod {
       for (uint8_t i = 0; i < 6; i++) sig = sig * 131 + patt[i];
       sig = sig * 3 + (colon ? 1 : 0);
       sig = sig * 131 + wdm;
-      sig = sig * 3 + (inNight() ? 1 : 0);
+      sig = sig * 3 + (inNight() ? 1 + nightAction : 0);
       sig = sig * 3 + (ringing ? 1 + ((millis() / 500) % 2) : 0);
       return sig;
     }
@@ -458,6 +469,7 @@ class UsermodAshishClock7Seg : public Usermod {
     void setup() {
       setupDone = true;
       buildOrder();
+      if (startupTest) bootTestUntil = millis() + 3000;
       if (configRead) initHw();
     }
 
@@ -499,8 +511,9 @@ class UsermodAshishClock7Seg : public Usermod {
       uint16_t endLed = firstLed + ledsNeeded();
       if (endLed > total) endLed = total;
 
-      bool blank = (inNight() && !testMode) || (ringing && ((millis() / 500) % 2) == 1);
-      if (blank) {
+      bool night = inNight() && !testMode;
+      bool ringBlank = ringing && ((millis() / 500) % 2) == 1;
+      if (ringBlank || (night && nightAction == 0)) {
         for (uint16_t i = firstLed; i < endLed; i++) strip.setPixelColor(i, 0);
         return;
       }
@@ -513,10 +526,11 @@ class UsermodAshishClock7Seg : public Usermod {
       if (st == 1 || st == 2) hasDigitCol = parseHex(dateHex, dcol);
       else if (st == 3)       hasDigitCol = parseHex(tempHex, dcol);
 
+      // digits
       for (uint8_t d = 0; d < n; d++) {
         for (uint8_t s = 0; s < 7; s++) {
           bool lit = (patt[d] >> (order[s] - 'A')) & 1;
-          uint16_t base = firstLed + ((uint16_t)d * 7 + s) * ledsPerSeg;
+          uint16_t base = digitBase(d) + (uint16_t)s * ledsPerSeg;
           for (uint8_t k = 0; k < ledsPerSeg; k++) {
             if (base + k >= total) break;
             if (!lit) strip.setPixelColor(base + k, 0);
@@ -525,25 +539,42 @@ class UsermodAshishClock7Seg : public Usermod {
         }
       }
 
+      // colons (one after HH, one after MM)
       uint32_t col;
       bool hasColonCol = parseHex(colonHex, col);
-      for (uint8_t k = 0; k < colonLeds; k++) {
-        uint16_t i = colonBase() + k;
-        if (i >= total) break;
-        if (!colon) strip.setPixelColor(i, 0);
-        else if (hasColonCol) strip.setPixelColor(i, col);
+      for (uint8_t c = 0; c < colonCount(); c++) {
+        for (uint8_t k = 0; k < colonLeds; k++) {
+          uint16_t i = colonBaseAt(c) + k;
+          if (i >= total) break;
+          if (!colon) strip.setPixelColor(i, 0);
+          else if (hasColonCol) strip.setPixelColor(i, col);
+        }
       }
 
-      uint32_t wcol;
-      bool hasWdCol = parseHex(wdHex, wcol);
+      // weekdays: 0 = off, 1 = only today, 2 = all on (today in its own colour)
+      uint32_t todayCol = 0xFF0000, otherCol = 0;
+      bool hasToday = parseHex(wdHex, todayCol);
+      bool hasOther = parseHex(otherHex, otherCol);
       for (uint8_t d = 0; d < 7; d++) {
-        bool lit = weekdaysOn && ((wdm >> d) & 1);
+        bool isToday = (wdm >> d) & 1;
         for (uint8_t k = 0; k < ledsPerDay; k++) {
           uint16_t i = dayBase() + d * ledsPerDay + k;
           if (i >= total) break;
-          if (!lit) strip.setPixelColor(i, 0);
-          else if (hasWdCol) strip.setPixelColor(i, wcol);
+          if (weekdayMode == 0) strip.setPixelColor(i, 0);
+          else if (weekdayMode == 1) {
+            if (!isToday) strip.setPixelColor(i, 0);
+            else if (hasToday) strip.setPixelColor(i, todayCol);
+          } else {
+            if (isToday) strip.setPixelColor(i, todayCol);        // red unless you set Weekday Hex
+            else if (hasOther) strip.setPixelColor(i, otherCol);  // else main page colour
+          }
         }
+      }
+
+      // night dim: lower the brightness of everything that is lit
+      if (night && nightAction == 1) {
+        uint8_t amt = (uint8_t)(((uint16_t)constrain(nightDim, 1, 100) * 255) / 100);
+        for (uint16_t i = firstLed; i < endLed; i++) strip.setPixelColor(i, color_fade(strip.getPixelColor(i), amt));
       }
     }
 
@@ -639,7 +670,7 @@ class UsermodAshishClock7Seg : public Usermod {
       w[F("seg-preset")] = segPreset;
       w[F("seg-order")] = segCustom;
       w[F("leds-per-segment")] = ledsPerSeg;
-      w[F("colon-leds")] = colonLeds;
+      w[F("leds-per-colon")] = colonLeds;
       w[F("leds-per-weekday")] = ledsPerDay;
 
       JsonObject d = top.createNestedObject(F("display"));
@@ -647,7 +678,8 @@ class UsermodAshishClock7Seg : public Usermod {
       d[F("hour-format")] = hourFormat;
       d[F("leading-zero")] = leadingZero;
       d[F("colon-blink")] = colonBlink;
-      d[F("weekdays-on")] = weekdaysOn;
+      d[F("weekday-mode")] = weekdayMode;
+      d[F("startup-test")] = startupTest;
 
       JsonObject dt = top.createNestedObject(F("date"));
       dt[F("show")] = dateShow;
@@ -664,6 +696,7 @@ class UsermodAshishClock7Seg : public Usermod {
 
       JsonObject c = top.createNestedObject(F("colors"));
       c[F("weekday-hex")] = wdHex;
+      c[F("other-days-hex")] = otherHex;
       c[F("colon-hex")] = colonHex;
       c[F("date-hex")] = dateHex;
       c[F("temp-hex")] = tempHex;
@@ -690,6 +723,8 @@ class UsermodAshishClock7Seg : public Usermod {
       n[F("enabled")] = nightOn;
       n[F("start-hour")] = nightStart;
       n[F("end-hour")] = nightEnd;
+      n[F("action")] = nightAction;
+      n[F("dim-percent")] = nightDim;
 
       JsonObject b = top.createNestedObject(F("brightness"));
       b[F("auto")] = autoBri;
@@ -721,7 +756,7 @@ class UsermodAshishClock7Seg : public Usermod {
       ok &= getJsonValue(w[F("seg-preset")], segPreset, (uint8_t)1);
       copyStr(segCustom, sizeof(segCustom), w[F("seg-order")] | "FABCDEG");
       ok &= getJsonValue(w[F("leds-per-segment")], ledsPerSeg, (uint8_t)1);
-      ok &= getJsonValue(w[F("colon-leds")], colonLeds, (uint8_t)2);
+      ok &= getJsonValue(w[F("leds-per-colon")], colonLeds, (uint8_t)2);
       ok &= getJsonValue(w[F("leds-per-weekday")], ledsPerDay, (uint8_t)1);
 
       JsonObject d = top[F("display")];
@@ -729,7 +764,8 @@ class UsermodAshishClock7Seg : public Usermod {
       ok &= getJsonValue(d[F("hour-format")], hourFormat, (uint8_t)0);
       ok &= getJsonValue(d[F("leading-zero")], leadingZero, true);
       ok &= getJsonValue(d[F("colon-blink")], colonBlink, true);
-      ok &= getJsonValue(d[F("weekdays-on")], weekdaysOn, true);
+      ok &= getJsonValue(d[F("weekday-mode")], weekdayMode, (uint8_t)1);
+      ok &= getJsonValue(d[F("startup-test")], startupTest, false);
 
       JsonObject dt = top[F("date")];
       ok &= getJsonValue(dt[F("show")], dateShow, false);
@@ -746,6 +782,7 @@ class UsermodAshishClock7Seg : public Usermod {
 
       JsonObject c = top[F("colors")];
       copyStr(wdHex, sizeof(wdHex), c[F("weekday-hex")] | "");
+      copyStr(otherHex, sizeof(otherHex), c[F("other-days-hex")] | "");
       copyStr(colonHex, sizeof(colonHex), c[F("colon-hex")] | "");
       copyStr(dateHex, sizeof(dateHex), c[F("date-hex")] | "");
       copyStr(tempHex, sizeof(tempHex), c[F("temp-hex")] | "");
@@ -773,6 +810,8 @@ class UsermodAshishClock7Seg : public Usermod {
       ok &= getJsonValue(n[F("enabled")], nightOn, false);
       ok &= getJsonValue(n[F("start-hour")], nightStart, (uint8_t)23);
       ok &= getJsonValue(n[F("end-hour")], nightEnd, (uint8_t)6);
+      ok &= getJsonValue(n[F("action")], nightAction, (uint8_t)0);
+      ok &= getJsonValue(n[F("dim-percent")], nightDim, (uint8_t)20);
 
       JsonObject b = top[F("brightness")];
       ok &= getJsonValue(b[F("auto")], autoBri, false);
@@ -796,6 +835,8 @@ class UsermodAshishClock7Seg : public Usermod {
       hourFormat = hourFormat ? 1 : 0;
       ledsPerSeg = constrain(ledsPerSeg, 1, 10);
       colonLeds  = constrain(colonLeds, 1, 6);
+      weekdayMode = weekdayMode > 2 ? 1 : weekdayMode;
+      nightAction = nightAction ? 1 : 0; nightDim = constrain(nightDim, 1, 100);
       ledsPerDay = constrain(ledsPerDay, 1, 5);
       segPreset  = segPreset > 4 ? 1 : segPreset;
       dateOrder  = dateOrder ? 1 : 0;
@@ -822,42 +863,48 @@ class UsermodAshishClock7Seg : public Usermod {
       oappend(F("addOption(dd,'HH:MM:SS (6 digits)',0);addOption(dd,'HH:MM (4 digits)',1);"));
       oappend(F("dd=addDropdown('Ashish Automation:display','hour-format');"));
       oappend(F("addOption(dd,'24 hour',0);addOption(dd,'12 hour',1);"));
+      oappend(F("dd=addDropdown('Ashish Automation:display','weekday-mode');"));
+      oappend(F("addOption(dd,'Off',0);addOption(dd,'Today only',1);addOption(dd,'All on, today different',2);"));
       oappend(F("dd=addDropdown('Ashish Automation:wiring','seg-preset');"));
-      oappend(F("addOption(dd,'Custom (use text below)',0);addOption(dd,'F-A-B-C-D-E-G (default)',1);"));
-      oappend(F("addOption(dd,'A-B-C-D-E-F-G',2);addOption(dd,'G-F-E-D-C-B-A',3);addOption(dd,'G-A-B-C-D-E-F',4);"));
+      oappend(F("addOption(dd,'Custom (use Seg Order)',0);addOption(dd,'F-A-B-C-D-E-G (default)',1);addOption(dd,'A-B-C-D-E-F-G',2);addOption(dd,'G-F-E-D-C-B-A',3);addOption(dd,'G-A-B-C-D-E-F',4);"));
       oappend(F("dd=addDropdown('Ashish Automation:date','order');"));
       oappend(F("addOption(dd,'Day then Month',0);addOption(dd,'Month then Day',1);"));
       oappend(F("dd=addDropdown('Ashish Automation:temperature','unit');"));
       oappend(F("addOption(dd,'Celsius (C)',0);addOption(dd,'Fahrenheit (F)',1);"));
       oappend(F("dd=addDropdown('Ashish Automation:alarm','days');"));
-      oappend(F("addOption(dd,'Every day',0);addOption(dd,'Monday to Friday',1);addOption(dd,'Saturday and Sunday',2);"));
+      oappend(F("addOption(dd,'Every day',0);addOption(dd,'Mon to Fri',1);addOption(dd,'Sat and Sun',2);"));
+      oappend(F("dd=addDropdown('Ashish Automation:night','action');"));
+      oappend(F("addOption(dd,'Display off',0);addOption(dd,'Dim',1);"));
       oappend(F("dd=addDropdown('Ashish Automation:rtc','chip');"));
-      oappend(F("addOption(dd,'DS1307',0);addOption(dd,'DS3231 (has temperature)',1);"));
+      oappend(F("addOption(dd,'DS1307',0);addOption(dd,'DS3231 (has temp)',1);"));
       oappend(F("dd=addDropdown('Ashish Automation:test','mode');"));
-      oappend(F("addOption(dd,'Off (normal clock)',0);addOption(dd,'All segments ON',1);"));
-      oappend(F("addOption(dd,'Segment walk A to G',2);addOption(dd,'Digits 0-9 count',3);"));
+      oappend(F("addOption(dd,'Off (normal clock)',0);addOption(dd,'All segments ON',1);addOption(dd,'Segment walk A to G',2);addOption(dd,'Digits 0-9 count',3);"));
 
-      oappend(F("addInfo('Ashish Automation:wiring:first-led',1,'LED number where digit 1 starts (0 = first)');"));
-      oappend(F("addInfo('Ashish Automation:wiring:seg-order',1,'only if preset = Custom. 7 letters A-G');"));
-      oappend(F("addInfo('Ashish Automation:wiring:leds-per-segment',1,'1 to 10');"));
-      oappend(F("addInfo('Ashish Automation:wiring:colon-leds',1,'1 to 6, all colon dots together');"));
-      oappend(F("addInfo('Ashish Automation:wiring:leds-per-weekday',1,'1 to 5');"));
-      oappend(F("addInfo('Ashish Automation:temperature:show',1,'needs DS3231 RTC');"));
-      oappend(F("addInfo('Ashish Automation:temperature:offset',1,'degrees C added to reading (-9 to 9)');"));
-      oappend(F("addInfo('Ashish Automation:colors:weekday-hex',1,'RRGGBB, empty = effect colour');"));
-      oappend(F("addInfo('Ashish Automation:colors:colon-hex',1,'RRGGBB, empty = effect colour');"));
-      oappend(F("addInfo('Ashish Automation:colors:date-hex',1,'RRGGBB for date/year');"));
-      oappend(F("addInfo('Ashish Automation:colors:temp-hex',1,'RRGGBB for temperature');"));
-      oappend(F("addInfo('Ashish Automation:alarm:ring-sec',1,'ring time 5-255 s');"));
-      oappend(F("addInfo('Ashish Automation:alarm:snooze-min',1,'0 = no snooze (button press = snooze)');"));
-      oappend(F("addInfo('Ashish Automation:hourly-chime:start-hour',1,'0-23, first chime hour');"));
-      oappend(F("addInfo('Ashish Automation:hourly-chime:end-hour',1,'0-23, last chime hour');"));
-      oappend(F("addInfo('Ashish Automation:buzzer-button:buzzer-pin',1,'active buzzer, -1 = none');"));
-      oappend(F("addInfo('Ashish Automation:buzzer-button:button-pin',1,'to GND. short=snooze/date, long=alarm on/off');"));
-      oappend(F("addInfo('Ashish Automation:night:start-hour',1,'0-23, display OFF from');"));
-      oappend(F("addInfo('Ashish Automation:night:end-hour',1,'0-23, display back ON at');"));
-      oappend(F("addInfo('Ashish Automation:brightness:ldr-pin',1,'ESP32 only (32-39). ESP8266 uses A0');"));
-      oappend(F("addInfo('Ashish Automation:rtc:sync-hours',1,'NTP to RTC every N hours (0 = once)');"));
+      oappend(F("addInfo('Ashish Automation:wiring:first-led',1,'<br><small>LED number of digit 1 (0 = first)</small>');"));
+      oappend(F("addInfo('Ashish Automation:wiring:seg-order',1,'<br><small>Only if preset = Custom. Letters A-G</small>');"));
+      oappend(F("addInfo('Ashish Automation:wiring:leds-per-segment',1,'<br><small>1 to 10</small>');"));
+      oappend(F("addInfo('Ashish Automation:wiring:leds-per-colon',1,'<br><small>1 to 6 LEDs in ONE colon</small>');"));
+      oappend(F("addInfo('Ashish Automation:wiring:leds-per-weekday',1,'<br><small>1 to 5</small>');"));
+      oappend(F("addInfo('Ashish Automation:display:weekday-mode',1,'<br><small>All on: today = Weekday Hex (red)</small>');"));
+      oappend(F("addInfo('Ashish Automation:display:startup-test',1,'<br><small>All LEDs ON for 3 s at power on</small>');"));
+      oappend(F("addInfo('Ashish Automation:temperature:show',1,'<br><small>Needs DS3231 RTC</small>');"));
+      oappend(F("addInfo('Ashish Automation:temperature:offset',1,'<br><small>Degrees C added (-9 to 9)</small>');"));
+      oappend(F("addInfo('Ashish Automation:colors:weekday-hex',1,'<br><small>Today colour. RRGGBB, empty = main</small>');"));
+      oappend(F("addInfo('Ashish Automation:colors:other-days-hex',1,'<br><small>Other 6 days. RRGGBB, empty = main</small>');"));
+      oappend(F("addInfo('Ashish Automation:colors:colon-hex',1,'<br><small>RRGGBB, empty = main colour</small>');"));
+      oappend(F("addInfo('Ashish Automation:colors:date-hex',1,'<br><small>Date and year. RRGGBB</small>');"));
+      oappend(F("addInfo('Ashish Automation:colors:temp-hex',1,'<br><small>Temperature. RRGGBB</small>');"));
+      oappend(F("addInfo('Ashish Automation:alarm:ring-sec',1,'<br><small>5 to 255 seconds</small>');"));
+      oappend(F("addInfo('Ashish Automation:alarm:snooze-min',1,'<br><small>0 = no snooze</small>');"));
+      oappend(F("addInfo('Ashish Automation:hourly-chime:start-hour',1,'<br><small>0-23, first chime</small>');"));
+      oappend(F("addInfo('Ashish Automation:hourly-chime:end-hour',1,'<br><small>0-23, last chime</small>');"));
+      oappend(F("addInfo('Ashish Automation:buzzer-button:buzzer-pin',1,'<br><small>Active buzzer</small>');"));
+      oappend(F("addInfo('Ashish Automation:buzzer-button:button-pin',1,'<br><small>Button to GND</small>');"));
+      oappend(F("addInfo('Ashish Automation:night:start-hour',1,'<br><small>0-23, night starts</small>');"));
+      oappend(F("addInfo('Ashish Automation:night:end-hour',1,'<br><small>0-23, night ends</small>');"));
+      oappend(F("addInfo('Ashish Automation:night:dim-percent',1,'<br><small>1-100, used when Action = Dim</small>');"));
+      oappend(F("addInfo('Ashish Automation:brightness:ldr-pin',1,'<br><small>ESP32: 32-39. ESP8266: A0</small>');"));
+      oappend(F("addInfo('Ashish Automation:rtc:sync-hours',1,'<br><small>Copy net time to RTC (0 = once)</small>');"));
     }
 
     uint16_t getId() { return USERMOD_ID_UNSPECIFIED; }
