@@ -3,8 +3,9 @@
  * Ashish Automation - 7 segment pixel-LED clock usermod for WLED 0.15.0 (ESP8266 + ESP32)
  *
  * LED chain order (one data line):
- *   HH -> colon -> MM -> colon -> SS -> weekdays SUN..SAT      (HH:MM:SS)
- *   HH -> colon -> MM -> weekdays SUN..SAT                      (HH:MM)
+ *   HH -> colon -> MM -> colon -> SS -> weekdays SUN..SAT -> AM LEDs -> PM LEDs   (HH:MM:SS)
+ *   HH -> colon -> MM -> weekdays SUN..SAT -> AM LEDs -> PM LEDs                   (HH:MM)
+ *   (AM/PM LEDs only exist in the chain when the AM/PM option is on)
  *   digit = 7 segments (physical order selectable, default F-A-B-C-D-E-G), 1..10 LEDs per segment
  *   colon = 1..6 LEDs per colon
  *
@@ -43,6 +44,8 @@ class UsermodAshishClock7Seg : public Usermod {
     uint8_t ledsPerSeg   = 1;      // 1..10
     uint8_t colonLeds    = 2;      // 1..6 LEDs PER colon
     uint8_t ledsPerDay   = 1;      // 1..5
+    bool    ampmOn       = false;  // AM / PM LEDs after the weekday LEDs
+    uint8_t ampmLeds     = 1;      // 1..6 LEDs for AM, same for PM
 
     bool    dateShow     = false;
     uint8_t dateOrder    = 0;      // 0 = DD MM, 1 = MM DD
@@ -52,11 +55,15 @@ class UsermodAshishClock7Seg : public Usermod {
 
     bool    tempShow     = false;  // needs DS3231
     uint8_t tempUnit     = 0;      // 0 = C, 1 = F
+    uint8_t tempSource   = 0;      // 0 = DS3231 RTC, 1 = BMP280
     uint8_t secTemp      = 2;
     int8_t  tempOffset   = 0;      // degrees C added to reading
 
     char    wdHex[10]    = "";     // today colour (empty = effect colour; mode 2 default red)
     char    otherHex[10] = "";     // other days colour in mode 2 (empty = effect colour)
+    char    weekendHex[10] = "";   // Sat/Sun colour in mode 2 (empty = other days colour)
+    char    amHex[10]    = "";
+    char    pmHex[10]    = "";
     char    colonHex[10] = "";
     char    dateHex[10]  = "";
     char    tempHex[10]  = "";
@@ -93,6 +100,8 @@ class UsermodAshishClock7Seg : public Usermod {
     int8_t  rtcSda       = C7_DEF_SDA;
     int8_t  rtcScl       = C7_DEF_SCL;
     uint8_t rtcSyncHours = 6;
+    bool    rereadOn     = true;   // re-read RTC when there is no internet time
+    uint8_t rereadMin    = 5;      // minutes between re-reads
 
     uint8_t testMode     = 0;      // 0 off, 1 all on, 2 segment walk, 3 digit count
 
@@ -107,6 +116,17 @@ class UsermodAshishClock7Seg : public Usermod {
     bool     rtcLoaded   = false;
     bool     rtcWritten  = false;
     float    tempC       = -100.0f;
+    float    pressHpa    = 0.0f;
+    bool     bmpReady    = false;
+    uint8_t  bmpAddr     = 0x76;
+    int32_t  tFine       = 0;
+    uint16_t dT1 = 0, dP1 = 0;
+    int16_t  dT2 = 0, dT3 = 0, dP2 = 0, dP3 = 0, dP4 = 0, dP5 = 0, dP6 = 0, dP7 = 0, dP8 = 0, dP9 = 0;
+    bool     offline     = true;
+    int32_t  rtcDiff     = 0;
+    uint16_t rereadCount = 0;
+    unsigned long lastReread = 0, lastRereadAt = 0;
+    uint8_t  ampmMask    = 0;
     unsigned long lastRtcWrite = 0, lastRtcTry = 0, lastTick = 0, lastBriApply = 0, lastTemp = 0;
     uint32_t lastSig     = 0xFFFFFFFF;
     float    ldrAvg      = -1;
@@ -133,7 +153,8 @@ class UsermodAshishClock7Seg : public Usermod {
     uint16_t digitBase(uint8_t d) const { return firstLed + (uint16_t)d * 7 * ledsPerSeg + (uint16_t)(d / 2) * colonLeds; }
     uint16_t colonBaseAt(uint8_t k) const { return firstLed + (uint16_t)(k + 1) * 2 * 7 * ledsPerSeg + (uint16_t)k * colonLeds; }
     uint16_t dayBase()   const { return firstLed + (uint16_t)digitCount() * 7 * ledsPerSeg + (uint16_t)colonCount() * colonLeds; }
-    uint16_t ledsNeeded() const { return (uint16_t)digitCount() * 7 * ledsPerSeg + (uint16_t)colonCount() * colonLeds + 7 * ledsPerDay; }
+    uint16_t ampmBase()  const { return dayBase() + 7 * ledsPerDay; }
+    uint16_t ledsNeeded() const { return (uint16_t)digitCount() * 7 * ledsPerSeg + (uint16_t)colonCount() * colonLeds + 7 * ledsPerDay + (ampmOn ? 2 * ampmLeds : 0); }
 
     static uint8_t bcd2dec(uint8_t v) { return (v >> 4) * 10 + (v & 0x0F); }
     static uint8_t dec2bcd(uint8_t v) { return ((v / 10) << 4) | (v % 10); }
@@ -247,10 +268,78 @@ class UsermodAshishClock7Seg : public Usermod {
       if (heldBtn >= 0) { PinManager::deallocatePin(heldBtn, PinOwner::UM_Unspecified); heldBtn = -1; }
     }
 
+    // ---------- BMP280 / BME280 (temperature + pressure, I2C 0x76 or 0x77) ----------
+    bool i2cReadRegs(uint8_t addr, uint8_t reg, uint8_t* buf, uint8_t n) {
+      Wire.beginTransmission(addr);
+      Wire.write(reg);
+      if (Wire.endTransmission() != 0) return false;
+      if ((uint8_t)Wire.requestFrom(addr, n) != n) return false;
+      for (uint8_t i = 0; i < n; i++) buf[i] = Wire.read();
+      return true;
+    }
+
+    bool i2cWriteReg(uint8_t addr, uint8_t reg, uint8_t v) {
+      Wire.beginTransmission(addr);
+      Wire.write(reg);
+      Wire.write(v);
+      return Wire.endTransmission() == 0;
+    }
+
+    bool bmpInit() {
+      for (uint8_t a = 0x76; a <= 0x77; a++) {
+        uint8_t id = 0;
+        if (!i2cReadRegs(a, 0xD0, &id, 1)) continue;
+        if (id != 0x58 && id != 0x56 && id != 0x57 && id != 0x60) continue;   // BMP280 / BME280
+        uint8_t c[24];
+        if (!i2cReadRegs(a, 0x88, c, 24)) continue;
+        dT1 = (uint16_t)(c[0] | (c[1] << 8));  dT2 = (int16_t)(c[2] | (c[3] << 8));  dT3 = (int16_t)(c[4] | (c[5] << 8));
+        dP1 = (uint16_t)(c[6] | (c[7] << 8));  dP2 = (int16_t)(c[8] | (c[9] << 8));  dP3 = (int16_t)(c[10] | (c[11] << 8));
+        dP4 = (int16_t)(c[12] | (c[13] << 8)); dP5 = (int16_t)(c[14] | (c[15] << 8)); dP6 = (int16_t)(c[16] | (c[17] << 8));
+        dP7 = (int16_t)(c[18] | (c[19] << 8)); dP8 = (int16_t)(c[20] | (c[21] << 8)); dP9 = (int16_t)(c[22] | (c[23] << 8));
+        i2cWriteReg(a, 0xF5, 0xA8);      // standby 1 s, filter x4
+        i2cWriteReg(a, 0xF4, 0x27);      // temp x1, pressure x1, normal mode
+        bmpAddr = a;
+        return true;
+      }
+      return false;
+    }
+
+    // Bosch datasheet integer compensation. Sets tempC (deg C) and pressHpa
+    void bmpCompensate(int32_t adcT, int32_t adcP) {
+      int32_t v1 = ((((adcT >> 3) - ((int32_t)dT1 << 1))) * ((int32_t)dT2)) >> 11;
+      int32_t v2 = (((((adcT >> 4) - ((int32_t)dT1)) * ((adcT >> 4) - ((int32_t)dT1))) >> 12) * ((int32_t)dT3)) >> 14;
+      tFine = v1 + v2;
+      tempC = ((tFine * 5 + 128) >> 8) / 100.0f;
+      int64_t a1 = (int64_t)tFine - 128000;
+      int64_t a2 = a1 * a1 * (int64_t)dP6;
+      a2 = a2 + ((a1 * (int64_t)dP5) << 17);
+      a2 = a2 + (((int64_t)dP4) << 35);
+      a1 = ((a1 * a1 * (int64_t)dP3) >> 8) + ((a1 * (int64_t)dP2) << 12);
+      a1 = (((((int64_t)1) << 47) + a1)) * ((int64_t)dP1) >> 33;
+      if (a1 == 0) { pressHpa = 0; return; }
+      int64_t p = 1048576 - adcP;
+      p = (((p << 31) - a2) * 3125) / a1;
+      a1 = (((int64_t)dP9) * (p >> 13) * (p >> 13)) >> 25;
+      a2 = (((int64_t)dP8) * p) >> 19;
+      p = ((p + a1 + a2) >> 8) + (((int64_t)dP7) << 4);
+      pressHpa = (float)p / 256.0f / 100.0f;
+    }
+
+    bool bmpRead() {
+      uint8_t d[6];
+      if (!i2cReadRegs(bmpAddr, 0xF7, d, 6)) return false;
+      int32_t adcP = ((int32_t)d[0] << 12) | ((int32_t)d[1] << 4) | (d[2] >> 4);
+      int32_t adcT = ((int32_t)d[3] << 12) | ((int32_t)d[4] << 4) | (d[5] >> 4);
+      if (adcT == 0x80000) return false;                      // no measurement yet
+      bmpCompensate(adcT, adcP);
+      return tempC > -40.0f && tempC < 85.0f;
+    }
+
     void initHw() {
       releasePins();
-      rtcReady = false; rtcPinError = false; rtcLoaded = false; ldrAvg = -1; tempC = -100.0f;
-      if (rtcEnabled && rtcSda >= 0 && rtcScl >= 0 && rtcSda != rtcScl) {
+      rtcReady = false; rtcPinError = false; rtcLoaded = false; ldrAvg = -1; tempC = -100.0f; bmpReady = false; pressHpa = 0;
+      bool needI2c = rtcEnabled || tempSource == 1;
+      if (needI2c && rtcSda >= 0 && rtcScl >= 0 && rtcSda != rtcScl) {
         bool sameAsGlobal = (rtcSda == i2c_sda && rtcScl == i2c_scl);
         bool ok = true;
         if (!sameAsGlobal) {
@@ -260,8 +349,11 @@ class UsermodAshishClock7Seg : public Usermod {
         }
         if (ok) {
           if (!sameAsGlobal) Wire.begin(rtcSda, rtcScl);
-          rtcReady = rtcProbe();
-          if (rtcReady) { rtcLoadToWled(); if (rtcChip == 1) rtcReadTemp(); }
+          if (rtcEnabled) {
+            rtcReady = rtcProbe();
+            if (rtcReady) { rtcLoadToWled(); if (rtcChip == 1 && tempSource == 0) rtcReadTemp(); }
+          }
+          if (tempSource == 1) bmpReady = bmpInit();
         }
       }
       #ifndef ESP8266
@@ -370,7 +462,9 @@ class UsermodAshishClock7Seg : public Usermod {
       return nightStart < nightEnd ? (h >= nightStart && h < nightEnd) : (h >= nightStart || h < nightEnd);
     }
 
-    bool tempUsable() const { return tempShow && rtcReady && rtcChip == 1 && tempC > -90.0f; }
+    bool internetOk() const { return WLED_CONNECTED && ntpEnabled && ntpLastSyncTime != NTP_NEVER && (millis() - ntpLastSyncTime) < 45000000UL; }
+
+    bool tempUsable() const { return tempShow && tempC > -90.0f && ((tempSource == 0 && rtcReady && rtcChip == 1) || (tempSource == 1 && bmpReady)); }
 
     uint8_t displayState() {   // 0 time, 1 day+month, 2 year, 3 temperature
       if (peekStart) {
@@ -408,11 +502,13 @@ class UsermodAshishClock7Seg : public Usermod {
       time_t t = localTime;
       uint8_t wd = weekday(t);                                // 1 = Sunday
       if (wd >= 1 && wd <= 7) wdMask = 1 << (wd - 1);
+      ampmMask = (hour(t) >= 12) ? 2 : 1;                     // bit0 = AM, bit1 = PM
 
       uint8_t tm = testMode;
       if (!tm && bootTestUntil) { if ((long)(bootTestUntil - millis()) > 0) tm = 1; else bootTestUntil = 0; }
       if (tm) {
         uint8_t step = (millis() / 800) % 7;
+        ampmMask = (tm == 2) ? ((step & 1) ? 2 : 1) : 3;
         if (tm == 1) { for (uint8_t i = 0; i < n; i++) patt[i] = 0x7F; colonOn = true; wdMask = 0x7F; }
         else if (tm == 2) { for (uint8_t i = 0; i < n; i++) patt[i] = 1 << step; wdMask = 1 << step; }
         else { uint8_t d = (millis() / 1000) % 10; for (uint8_t i = 0; i < n; i++) patt[i] = PAT[d]; colonOn = true; }
@@ -455,6 +551,7 @@ class UsermodAshishClock7Seg : public Usermod {
       for (uint8_t i = 0; i < 6; i++) sig = sig * 131 + patt[i];
       sig = sig * 3 + (colon ? 1 : 0);
       sig = sig * 131 + wdm;
+      sig = sig * 5 + ampmMask;
       sig = sig * 3 + (inNight() ? 1 + nightAction : 0);
       sig = sig * 3 + (ringing ? 1 + ((millis() / 500) % 2) : 0);
       return sig;
@@ -480,10 +577,33 @@ class UsermodAshishClock7Seg : public Usermod {
       if (now - lastTick < 100) return;
       lastTick = now;
 
+      // temperature sensor (every 10 s)
+      if (now - lastTemp > 10000) {
+        lastTemp = now;
+        if (tempSource == 1) { if (bmpReady) bmpRead(); }
+        else if (rtcEnabled && rtcReady && rtcChip == 1) rtcReadTemp();
+      }
+
       // RTC maintenance
       if (rtcEnabled && rtcReady) {
         if (!rtcLoaded && now - lastRtcTry > 10000) { lastRtcTry = now; rtcLoadToWled(); }
-        if (rtcChip == 1 && now - lastTemp > 10000) { lastTemp = now; rtcReadTemp(); }
+
+        // internet time good? (WiFi up, NTP on, synced in the last ~12 h)
+        bool online = internetOk();
+        if (online) { if (offline) { offline = false; rtcWritten = false; } }   // internet is back: update RTC soon
+        else offline = true;
+
+        // no internet time: correct the clock from the RTC every N minutes (only if 2 s or more off)
+        if (rereadOn && !online && now - lastReread >= (unsigned long)rereadMin * 60000UL) {
+          lastReread = now;
+          time_t rt;
+          if (rtcRead(rt)) {
+            rtcDiff = (int32_t)((uint32_t)toki.second() - (uint32_t)rt);
+            lastRereadAt = now; if (rereadCount < 65535) rereadCount++;
+            if (rtcDiff >= 2 || rtcDiff <= -2) { toki.setTime(rt, TOKI_NO_MS_ACCURACY, TOKI_TS_RTC); updateLocalTime(); }
+          }
+        }
+
         uint8_t src = toki.getTimeSource();
         if (src > TOKI_TS_RTC) {                              // time came from NTP / browser
           bool due = !rtcWritten || (rtcSyncHours > 0 && now - lastRtcWrite > (unsigned long)rtcSyncHours * 3600000UL);
@@ -555,6 +675,8 @@ class UsermodAshishClock7Seg : public Usermod {
       uint32_t todayCol = 0xFF0000, otherCol = 0;
       bool hasToday = parseHex(wdHex, todayCol);
       bool hasOther = parseHex(otherHex, otherCol);
+      uint32_t weekendCol = 0;
+      bool hasWeekend = parseHex(weekendHex, weekendCol);
       for (uint8_t d = 0; d < 7; d++) {
         bool isToday = (wdm >> d) & 1;
         for (uint8_t k = 0; k < ledsPerDay; k++) {
@@ -566,7 +688,24 @@ class UsermodAshishClock7Seg : public Usermod {
             else if (hasToday) strip.setPixelColor(i, todayCol);
           } else {
             if (isToday) strip.setPixelColor(i, todayCol);        // red unless you set Weekday Hex
+            else if ((d == 0 || d == 6) && hasWeekend) strip.setPixelColor(i, weekendCol);   // Sun / Sat
             else if (hasOther) strip.setPixelColor(i, otherCol);  // else main page colour
+          }
+        }
+      }
+
+      // AM / PM LEDs (after the weekday LEDs): AM group first, then PM group
+      if (ampmOn) {
+        uint32_t amCol = 0, pmCol = 0;
+        bool hasAm = parseHex(amHex, amCol), hasPm = parseHex(pmHex, pmCol);
+        for (uint8_t g = 0; g < 2; g++) {
+          bool lit = (ampmMask >> g) & 1;
+          for (uint8_t k = 0; k < ampmLeds; k++) {
+            uint16_t i = ampmBase() + g * ampmLeds + k;
+            if (i >= total) break;
+            if (!lit) strip.setPixelColor(i, 0);
+            else if (g == 0 && hasAm) strip.setPixelColor(i, amCol);
+            else if (g == 1 && hasPm) strip.setPixelColor(i, pmCol);
           }
         }
       }
@@ -622,10 +761,26 @@ class UsermodAshishClock7Seg : public Usermod {
       else if (rtcReady) { a5.add(rtcLoaded || rtcWritten ? F("OK") : F("found, time not set yet")); a5.add(rtcChip ? F(" (DS3231)") : F(" (DS1307)")); }
       else a5.add(F("NOT found - check SDA/SCL/power"));
 
+      // 5b) RTC re-read (when there is no internet time)
+      JsonArray a5b = user.createNestedArray(F("Clock RTC re-read"));
+      if (!rtcEnabled || !rtcReady) a5b.add(F("n/a"));
+      else if (!rereadOn) a5b.add(F("off"));
+      else if (internetOk()) a5b.add(F("not needed (internet time OK)"));
+      else if (rereadCount == 0) { snprintf(b, sizeof(b), "every %d min, waiting", rereadMin); a5b.add(String(b)); }
+      else { snprintf(b, sizeof(b), "every %d min, last diff %ld s", rereadMin, (long)rtcDiff); a5b.add(String(b)); }
+
       // 6) Temperature
       JsonArray a6 = user.createNestedArray(F("Clock temperature"));
-      if (rtcChip == 1 && tempC > -90.0f) { snprintf(b, sizeof(b), "%d %s", tempShown(), tempUnit ? "F" : "C"); a6.add(String(b)); }
-      else a6.add(F("n/a (needs DS3231)"));
+      if (tempSource == 1) {
+        if (!bmpReady) a6.add(F("BMP280 NOT found"));
+        else if (tempC < -90.0f) a6.add(F("reading..."));
+        else { snprintf(b, sizeof(b), "%d %s", tempShown(), tempUnit ? "F" : "C"); a6.add(String(b)); a6.add(F(" (BMP280)")); }
+      } else if (rtcChip == 1 && tempC > -90.0f) { snprintf(b, sizeof(b), "%d %s", tempShown(), tempUnit ? "F" : "C"); a6.add(String(b)); a6.add(F(" (DS3231)")); }
+      else a6.add(F("n/a (needs DS3231 or BMP280)"));
+      if (tempSource == 1 && bmpReady && pressHpa > 1.0f) {
+        JsonArray a6p = user.createNestedArray(F("Clock pressure"));
+        snprintf(b, sizeof(b), "%d hPa", (int)lroundf(pressHpa)); a6p.add(String(b));
+      }
 
       // 7) Alarm
       JsonArray a7 = user.createNestedArray(F("Clock alarm"));
@@ -673,6 +828,12 @@ class UsermodAshishClock7Seg : public Usermod {
       w[F("leds-per-colon")] = colonLeds;
       w[F("leds-per-weekday")] = ledsPerDay;
 
+      JsonObject ap = top.createNestedObject(F("am-pm-leds"));
+      ap[F("enabled")] = ampmOn;
+      ap[F("leds-each")] = ampmLeds;
+      ap[F("am-hex")] = amHex;
+      ap[F("pm-hex")] = pmHex;
+
       JsonObject d = top.createNestedObject(F("display"));
       d[F("mode")] = mode;
       d[F("hour-format")] = hourFormat;
@@ -690,6 +851,7 @@ class UsermodAshishClock7Seg : public Usermod {
 
       JsonObject tp = top.createNestedObject(F("temperature"));
       tp[F("show")] = tempShow;
+      tp[F("source")] = tempSource;
       tp[F("unit")] = tempUnit;
       tp[F("temp-sec")] = secTemp;
       tp[F("offset")] = tempOffset;
@@ -697,6 +859,7 @@ class UsermodAshishClock7Seg : public Usermod {
       JsonObject c = top.createNestedObject(F("colors"));
       c[F("weekday-hex")] = wdHex;
       c[F("other-days-hex")] = otherHex;
+      c[F("weekend-hex")] = weekendHex;
       c[F("colon-hex")] = colonHex;
       c[F("date-hex")] = dateHex;
       c[F("temp-hex")] = tempHex;
@@ -739,6 +902,8 @@ class UsermodAshishClock7Seg : public Usermod {
       r[F("sda-pin")] = rtcSda;
       r[F("scl-pin")] = rtcScl;
       r[F("sync-hours")] = rtcSyncHours;
+      r[F("reread-on")] = rereadOn;
+      r[F("reread-min")] = rereadMin;
 
       JsonObject t = top.createNestedObject(F("test"));
       t[F("mode")] = testMode;
@@ -759,6 +924,13 @@ class UsermodAshishClock7Seg : public Usermod {
       ok &= getJsonValue(w[F("leds-per-colon")], colonLeds, (uint8_t)2);
       ok &= getJsonValue(w[F("leds-per-weekday")], ledsPerDay, (uint8_t)1);
 
+      JsonObject ap = top[F("am-pm-leds")];
+      ok &= getJsonValue(ap[F("enabled")], ampmOn, false);
+      ok &= getJsonValue(ap[F("leds-each")], ampmLeds, (uint8_t)1);
+      copyStr(amHex, sizeof(amHex), ap[F("am-hex")] | "");
+      copyStr(pmHex, sizeof(pmHex), ap[F("pm-hex")] | "");
+      if (ap.isNull()) ok = false;
+
       JsonObject d = top[F("display")];
       ok &= getJsonValue(d[F("mode")], mode, (uint8_t)0);
       ok &= getJsonValue(d[F("hour-format")], hourFormat, (uint8_t)0);
@@ -776,6 +948,7 @@ class UsermodAshishClock7Seg : public Usermod {
 
       JsonObject tp = top[F("temperature")];
       ok &= getJsonValue(tp[F("show")], tempShow, false);
+      ok &= getJsonValue(tp[F("source")], tempSource, (uint8_t)0);
       ok &= getJsonValue(tp[F("unit")], tempUnit, (uint8_t)0);
       ok &= getJsonValue(tp[F("temp-sec")], secTemp, (uint8_t)2);
       ok &= getJsonValue(tp[F("offset")], tempOffset, (int8_t)0);
@@ -783,6 +956,7 @@ class UsermodAshishClock7Seg : public Usermod {
       JsonObject c = top[F("colors")];
       copyStr(wdHex, sizeof(wdHex), c[F("weekday-hex")] | "");
       copyStr(otherHex, sizeof(otherHex), c[F("other-days-hex")] | "");
+      copyStr(weekendHex, sizeof(weekendHex), c[F("weekend-hex")] | "");
       copyStr(colonHex, sizeof(colonHex), c[F("colon-hex")] | "");
       copyStr(dateHex, sizeof(dateHex), c[F("date-hex")] | "");
       copyStr(tempHex, sizeof(tempHex), c[F("temp-hex")] | "");
@@ -826,6 +1000,8 @@ class UsermodAshishClock7Seg : public Usermod {
       ok &= getJsonValue(r[F("sda-pin")], rtcSda, (int8_t)C7_DEF_SDA);
       ok &= getJsonValue(r[F("scl-pin")], rtcScl, (int8_t)C7_DEF_SCL);
       ok &= getJsonValue(r[F("sync-hours")], rtcSyncHours, (uint8_t)6);
+      ok &= getJsonValue(r[F("reread-on")], rereadOn, true);
+      ok &= getJsonValue(r[F("reread-min")], rereadMin, (uint8_t)5);
 
       JsonObject t = top[F("test")];
       ok &= getJsonValue(t[F("mode")], testMode, (uint8_t)0);
@@ -836,6 +1012,7 @@ class UsermodAshishClock7Seg : public Usermod {
       ledsPerSeg = constrain(ledsPerSeg, 1, 10);
       colonLeds  = constrain(colonLeds, 1, 6);
       weekdayMode = weekdayMode > 2 ? 1 : weekdayMode;
+      ampmLeds = constrain(ampmLeds, 1, 6); tempSource = tempSource ? 1 : 0; rereadMin = constrain(rereadMin, 1, 60);
       nightAction = nightAction ? 1 : 0; nightDim = constrain(nightDim, 1, 100);
       ledsPerDay = constrain(ledsPerDay, 1, 5);
       segPreset  = segPreset > 4 ? 1 : segPreset;
@@ -853,7 +1030,7 @@ class UsermodAshishClock7Seg : public Usermod {
 
       configRead = true;
       lastSig = 0xFFFFFFFF;
-      alarmKey = 0; snoozeAt = 0; ringing = false; alarmArmed = true;
+      alarmKey = 0; snoozeAt = 0; ringing = false; alarmArmed = true; lastReread = millis();
       if (setupDone) { buildOrder(); initHw(); }
       return ok;
     }
@@ -869,6 +1046,8 @@ class UsermodAshishClock7Seg : public Usermod {
       oappend(F("addOption(dd,'Custom (use Seg Order)',0);addOption(dd,'F-A-B-C-D-E-G (default)',1);addOption(dd,'A-B-C-D-E-F-G',2);addOption(dd,'G-F-E-D-C-B-A',3);addOption(dd,'G-A-B-C-D-E-F',4);"));
       oappend(F("dd=addDropdown('Ashish Automation:date','order');"));
       oappend(F("addOption(dd,'Day then Month',0);addOption(dd,'Month then Day',1);"));
+      oappend(F("dd=addDropdown('Ashish Automation:temperature','source');"));
+      oappend(F("addOption(dd,'DS3231 RTC sensor',0);addOption(dd,'BMP280 sensor',1);"));
       oappend(F("dd=addDropdown('Ashish Automation:temperature','unit');"));
       oappend(F("addOption(dd,'Celsius (C)',0);addOption(dd,'Fahrenheit (F)',1);"));
       oappend(F("dd=addDropdown('Ashish Automation:alarm','days');"));
@@ -905,6 +1084,14 @@ class UsermodAshishClock7Seg : public Usermod {
       oappend(F("addInfo('Ashish Automation:night:dim-percent',1,'<br><small>1-100, used when Action = Dim</small>');"));
       oappend(F("addInfo('Ashish Automation:brightness:ldr-pin',1,'<br><small>ESP32: 32-39. ESP8266: A0</small>');"));
       oappend(F("addInfo('Ashish Automation:rtc:sync-hours',1,'<br><small>Copy net time to RTC (0 = once)</small>');"));
+          oappend(F("addInfo('Ashish Automation:temperature:source',1,'<br><small>BMP280 shares SDA/SCL with RTC</small>');"));
+      oappend(F("addInfo('Ashish Automation:colors:weekend-hex',1,'<br><small>Sun and Sat (mode All on)</small>');"));
+      oappend(F("addInfo('Ashish Automation:am-pm-leds:enabled',1,'<br><small>AM/PM LEDs go after weekdays</small>');"));
+      oappend(F("addInfo('Ashish Automation:am-pm-leds:leds-each',1,'<br><small>1 to 6 LEDs for AM, same for PM</small>');"));
+      oappend(F("addInfo('Ashish Automation:am-pm-leds:am-hex',1,'<br><small>RRGGBB, empty = main colour</small>');"));
+      oappend(F("addInfo('Ashish Automation:am-pm-leds:pm-hex',1,'<br><small>RRGGBB, empty = main colour</small>');"));
+      oappend(F("addInfo('Ashish Automation:rtc:reread-on',1,'<br><small>Fix drift when no internet time</small>');"));
+      oappend(F("addInfo('Ashish Automation:rtc:reread-min',1,'<br><small>1 to 60 minutes</small>');"));
     }
 
     uint16_t getId() { return USERMOD_ID_UNSPECIFIED; }
