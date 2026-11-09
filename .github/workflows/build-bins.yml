@@ -30,6 +30,10 @@ jobs:
           sed -i '0,/#include "wled.h"/s//#include "wled.h"\n#ifdef USERMOD_ASHISH_CLOCK7SEG\n  #include "..\/usermods\/ashish_clock_7seg\/usermod_ashish_clock_7seg.h"\n#endif/' wled00/usermods_list.cpp
           sed -i '/^void registerUsermods()/{n;s/{/{\n  #ifdef USERMOD_ASHISH_CLOCK7SEG\n  UsermodManager::add(new UsermodAshishClock7Seg());\n  #endif/}' wled00/usermods_list.cpp
           grep -n "ASHISH\|Ashish" wled00/usermods_list.cpp
+          # default WiFi access point name
+          sed -i 's|^#define DEFAULT_AP_SSID .*|#define DEFAULT_AP_SSID     "CLOCK (Ashish Automation)"|' wled00/const.h
+          sed -i 's|Connect to WLED-AP to setup again|Connect to CLOCK (Ashish Automation) to setup again|' wled00/set.cpp
+          grep -n "DEFAULT_AP_SSID" wled00/const.h
           python3 - <<'PY'
           p = "wled00/data/welcome.htm"
           s = open(p, encoding="utf-8").read()
