@@ -65,9 +65,19 @@ jobs:
         run: |
           mkdir out
           cd wled
-          cp .pio/build/ashish_esp8266/firmware.bin ../out/Ashish_Clock_ESP8266_4MB.bin
-          cp .pio/build/ashish_esp32/firmware.bin   ../out/Ashish_Clock_ESP32_update.bin
-          [ -f .pio/build/ashish_esp8266_1m/firmware.bin ] && cp .pio/build/ashish_esp8266_1m/firmware.bin ../out/Ashish_Clock_ESP8266_1MB_cable_only.bin || echo "1MB build skipped"
+          echo "--- release folder ---"
+          ls -la build_output/release || true
+          pick() {  # $1 = build env, $2 = name used by WLED in build_output/release
+            if [ -f ".pio/build/$1/firmware.bin" ]; then echo ".pio/build/$1/firmware.bin"; return; fi
+            ls build_output/release/*_$2.bin 2>/dev/null | head -1
+          }
+          F8266=$(pick ashish_esp8266 ESP8266)
+          F32=$(pick ashish_esp32 ESP32)
+          F01=$(pick ashish_esp8266_1m ESP01)
+          echo "found: $F8266 | $F32 | $F01"
+          cp "$F8266" ../out/Ashish_Clock_ESP8266_4MB.bin
+          cp "$F32"   ../out/Ashish_Clock_ESP32_update.bin
+          if [ -n "$F01" ]; then cp "$F01" ../out/Ashish_Clock_ESP8266_1MB_cable_only.bin; else echo "1MB build skipped"; fi
           ls -la ../out
 
       - name: Make ESP32 first-install file (optional)
@@ -75,6 +85,7 @@ jobs:
         run: |
           cd wled
           B=.pio/build/ashish_esp32
+          FW=../out/Ashish_Clock_ESP32_update.bin
           BOOT=$(find ~/.platformio/packages -name boot_app0.bin | head -1)
           LOADER=$B/bootloader.bin
           [ -f "$LOADER" ] || LOADER=$(find ~/.platformio/packages -name 'bootloader_dio_40m.bin' | head -1)
@@ -88,7 +99,7 @@ jobs:
           echo "bootloader=$LOADER partitions=$PART boot_app0=$BOOT"
           esptool --chip esp32 merge-bin -o ../out/Ashish_Clock_ESP32_first_install.bin \
             --flash-mode dio --flash-size 4MB \
-            0x1000 "$LOADER" 0x8000 "$PART" 0xe000 "$BOOT" 0x10000 $B/firmware.bin
+            0x1000 "$LOADER" 0x8000 "$PART" 0xe000 "$BOOT" 0x10000 "$FW"
           ls -la ../out
 
       - name: Publish release (download links work on phone)
