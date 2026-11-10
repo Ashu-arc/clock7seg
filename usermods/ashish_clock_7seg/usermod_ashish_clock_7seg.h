@@ -39,8 +39,8 @@ class UsermodAshishClock7Seg : public Usermod {
     bool    startupTest  = false;  // lamp test for 3 s after power on
 
     uint16_t firstLed    = 0;
-    uint8_t segPreset    = 1;      // 0 = custom text, 1..4 presets
-    char    segCustom[9] = "FABCDEG";
+    uint8_t segPreset    = 1;      // 0 = custom, 1 = F-A-B-G-E-D-C (default), 2 = A-B-C-D-E-F-G, 3 = F-A-B-C-D-E-G
+    char    segCustom[9] = "FABGEDC";
     uint8_t ledsPerSeg   = 1;      // 1..10
     uint8_t colonLeds    = 2;      // 1..6 LEDs PER colon
     uint8_t ledsPerDay   = 1;      // 1..5
@@ -95,6 +95,13 @@ class UsermodAshishClock7Seg : public Usermod {
     uint8_t briMin       = 20;
     uint8_t briMax       = 255;
 
+    bool    cdOn         = true;   // countdown timer enabled
+    bool    swOn         = true;   // stopwatch enabled
+    uint8_t cdMin        = 10;     // countdown minutes 1..99
+    uint8_t timerRingSec = 10;     // beep time when countdown ends
+    char    timerHex[10] = "";
+    bool    tempAutoColor = false; // blue cold, green normal, red hot
+    bool    warnShow     = true;   // show bAtt when RTC battery/time problem
     bool    rtcEnabled   = true;
     uint8_t rtcChip      = 0;      // 0 = DS1307, 1 = DS3231
     int8_t  rtcSda       = C7_DEF_SDA;
@@ -106,7 +113,7 @@ class UsermodAshishClock7Seg : public Usermod {
     uint8_t testMode     = 0;      // 0 off, 1 all on, 2 segment walk, 3 digit count
 
     // ---------- runtime ----------
-    char     order[8]    = "FABCDEG";
+    char     order[8]    = "FABGEDC";
     bool     orderBad    = false;
     bool     setupDone   = false;
     bool     configRead  = false;
@@ -127,6 +134,10 @@ class UsermodAshishClock7Seg : public Usermod {
     uint16_t rereadCount = 0;
     unsigned long lastReread = 0, lastRereadAt = 0;
     uint8_t  ampmMask    = 0;
+    uint8_t  timerMode = 0;        // 0 clock, 1 countdown, 2 stopwatch
+    bool     timerRunning = false, timerDone = false, pendingShort = false;
+    unsigned long timerStartMs = 0, timerAccumMs = 0, timerRingEnd = 0, lastBtnAct = 0, pendingAt = 0, lastBattCheck = 0;
+    bool     rtcWarn = false, rtcOsf = false, rtcInvalid = false;
     unsigned long lastRtcWrite = 0, lastRtcTry = 0, lastTick = 0, lastBriApply = 0, lastTemp = 0;
     uint32_t lastSig     = 0xFFFFFFFF;
     float    ldrAvg      = -1;
@@ -141,8 +152,8 @@ class UsermodAshishClock7Seg : public Usermod {
     unsigned long bootTestUntil = 0;
     unsigned long btnSince = 0, btnChange = 0;
 
-    // bit0=A ... bit6=G ; 0-9 digits, 10 blank, 11 dash, 12 degree, 13 C, 14 F
-    static constexpr uint8_t PAT[15] = {0x3F,0x06,0x5B,0x4F,0x66,0x6D,0x7D,0x07,0x7F,0x6F,0x00,0x40,0x63,0x39,0x71};
+    // bit0=A ... bit6=G ; 0-9 digits, 10 blank, 11 dash, 12 degree, 13 C, 14 F, 15 b, 16 A, 17 t
+    static constexpr uint8_t PAT[18] = {0x3F,0x06,0x5B,0x4F,0x66,0x6D,0x7D,0x07,0x7F,0x6F,0x00,0x40,0x63,0x39,0x71,0x7C,0x77,0x78};
 
     static const char _name[];
 
@@ -175,10 +186,9 @@ class UsermodAshishClock7Seg : public Usermod {
     void buildOrder() {
       orderBad = false;
       switch (segPreset) {
-        case 1: strcpy(order, "FABCDEG"); return;
+        case 1: strcpy(order, "FABGEDC"); return;
         case 2: strcpy(order, "ABCDEFG"); return;
-        case 3: strcpy(order, "GFEDCBA"); return;
-        case 4: strcpy(order, "GABCDEF"); return;
+        case 3: strcpy(order, "FABCDEG"); return;
         default: break;
       }
       char tmp[8]; uint8_t seen = 0; uint8_t n = 0;
@@ -188,7 +198,7 @@ class UsermodAshishClock7Seg : public Usermod {
         if (c < 'A' || c > 'G' || (seen & (1 << (c - 'A')))) { orderBad = true; break; }
         seen |= 1 << (c - 'A'); tmp[n++] = c;
       }
-      if (orderBad || n != 7) { orderBad = true; strcpy(order, "FABCDEG"); return; }
+      if (orderBad || n != 7) { orderBad = true; strcpy(order, "FABGEDC"); return; }
       tmp[7] = 0; strcpy(order, tmp);
     }
 
@@ -205,7 +215,7 @@ class UsermodAshishClock7Seg : public Usermod {
       if (Wire.requestFrom((uint8_t)C7_RTC_ADDR, (uint8_t)7) != 7) return false;
       uint8_t b[7];
       for (int i = 0; i < 7; i++) b[i] = Wire.read();
-      if (b[0] & 0x80) return false;                          // DS1307 clock halted
+      if (b[0] & 0x80) { rtcInvalid = true; return false; }   // DS1307 clock halted
       tmElements_t tm;
       tm.Second = bcd2dec(b[0] & 0x7F);
       tm.Minute = bcd2dec(b[1] & 0x7F);
@@ -216,8 +226,9 @@ class UsermodAshishClock7Seg : public Usermod {
       tm.Day   = bcd2dec(b[4] & 0x3F);
       tm.Month = bcd2dec(b[5] & 0x1F);
       tm.Year  = bcd2dec(b[6]) + 30;
-      if (tm.Second > 59 || tm.Minute > 59 || tm.Hour > 23 || tm.Day < 1 || tm.Day > 31 || tm.Month < 1 || tm.Month > 12) return false;
-      if (tm.Year < 50) return false;                         // before 2020 = never set
+      if (tm.Second > 59 || tm.Minute > 59 || tm.Hour > 23 || tm.Day < 1 || tm.Day > 31 || tm.Month < 1 || tm.Month > 12) { rtcInvalid = true; return false; }
+      if (tm.Year < 50) { rtcInvalid = true; return false; }  // before 2020 = never set / battery was empty
+      rtcInvalid = false;
       out = makeTime(tm);
       return true;
     }
@@ -233,7 +244,23 @@ class UsermodAshishClock7Seg : public Usermod {
       Wire.write(dec2bcd(tm.Day));
       Wire.write(dec2bcd(tm.Month));
       Wire.write(dec2bcd(tm.Year - 30));
-      return Wire.endTransmission() == 0;
+      bool ok = Wire.endTransmission() == 0;
+      if (ok) { rtcInvalid = false; if (rtcChip == 1) rtcClearOsf(); updateRtcWarn(); }
+      return ok;
+    }
+
+    // DS3231 status register 0x0F bit 7 = oscillator stopped (battery was empty / power lost)
+    void rtcReadOsf() {
+      uint8_t st = 0;
+      if (i2cReadRegs(C7_RTC_ADDR, 0x0F, &st, 1)) rtcOsf = (st & 0x80) != 0;
+    }
+    void rtcClearOsf() { if (i2cWriteReg(C7_RTC_ADDR, 0x0F, 0x00)) rtcOsf = false; }
+    void updateRtcWarn() { rtcWarn = rtcEnabled && rtcReady && (rtcInvalid || (rtcChip == 1 && rtcOsf)); }
+    void rtcCheckBattery() {
+      time_t tmp;
+      rtcRead(tmp);                                            // updates rtcInvalid
+      if (rtcChip == 1) rtcReadOsf();
+      updateRtcWarn();
     }
 
     bool rtcReadTemp() {                                       // DS3231 only
@@ -351,7 +378,7 @@ class UsermodAshishClock7Seg : public Usermod {
           if (!sameAsGlobal) Wire.begin(rtcSda, rtcScl);
           if (rtcEnabled) {
             rtcReady = rtcProbe();
-            if (rtcReady) { rtcLoadToWled(); if (rtcChip == 1 && tempSource == 0) rtcReadTemp(); }
+            if (rtcReady) { rtcLoadToWled(); if (rtcChip == 1 && tempSource == 0) rtcReadTemp(); rtcCheckBattery(); }
           }
           if (tempSource == 1) bmpReady = bmpInit();
         }
@@ -420,13 +447,49 @@ class UsermodAshishClock7Seg : public Usermod {
       }
     }
 
+    // ---------- countdown timer / stopwatch ----------
+    uint32_t timerElapsedSec() const {
+      unsigned long ms = timerAccumMs + (timerRunning ? millis() - timerStartMs : 0);
+      uint32_t sec = ms / 1000UL;
+      return sec > 359999UL ? 359999UL : sec;
+    }
+    void exitTimer() { timerMode = 0; timerRunning = false; timerDone = false; timerAccumMs = 0; }
+    void enterTimer(uint8_t m) { timerMode = m; timerRunning = false; timerDone = false; timerAccumMs = 0; lastBtnAct = millis(); }
+    void timerToggle() {
+      unsigned long now = millis();
+      if (timerRunning) { timerAccumMs += now - timerStartMs; timerRunning = false; }
+      else { timerStartMs = now; timerRunning = true; }
+      lastBtnAct = now;
+    }
+    uint8_t nextTimerMode() const {
+      if (timerMode == 0) return cdOn ? 1 : (swOn ? 2 : 0);
+      if (timerMode == 1) return swOn ? 2 : 0;
+      return 0;
+    }
+    void checkTimer(unsigned long now) {
+      if (timerMode == 1 && timerRunning && !timerDone && timerElapsedSec() >= (uint32_t)cdMin * 60UL) {
+        timerRunning = false; timerDone = true;
+        timerAccumMs = (unsigned long)cdMin * 60000UL;
+        timerRingEnd = now + (unsigned long)timerRingSec * 1000UL;
+      }
+      if (timerDone && (long)(now - timerRingEnd) >= 0) exitTimer();
+      if (timerMode && !timerRunning && !timerDone && now - lastBtnAct > 120000UL) exitTimer();   // idle: back to clock
+    }
+
+    // ---------- button ----------
     void onPress(bool longPress) {
       unsigned long now = millis();
+      lastBtnAct = now;
       if (ringing) {
         ringing = false;
         if (!longPress && snoozeMin > 0) snoozeAt = (uint32_t)localTime + (uint32_t)snoozeMin * 60UL;
         else snoozeAt = 0;
         beepUntil = now + 80;
+      } else if (timerDone) {
+        exitTimer(); beepUntil = now + 80;
+      } else if (timerMode) {
+        if (longPress) { timerRunning = false; timerAccumMs = 0; beepUntil = now + 150; }   // reset
+        else { timerToggle(); beepUntil = now + 40; }                                       // start / pause
       } else if (longPress) {
         alarmArmed = !alarmArmed; snoozeAt = 0;
         beepUntil = now + (alarmArmed ? 250 : 80);
@@ -435,17 +498,30 @@ class UsermodAshishClock7Seg : public Usermod {
       }
     }
 
+    void onDouble() {                              // double press: clock > countdown > stopwatch > clock
+      uint8_t m = nextTimerMode();
+      if (m) enterTimer(m); else exitTimer();
+      beepUntil = millis() + 60;
+    }
+
     void pollButton(unsigned long now) {
+      if (pendingShort && now - pendingAt >= 450) { pendingShort = false; onPress(false); }
       if (heldBtn < 0) return;
       bool down = digitalRead(heldBtn) == LOW;
       if (down && !btnDown && now - btnChange > 40) { btnDown = true; btnChange = now; btnSince = now; }
-      else if (!down && btnDown && now - btnChange > 40) { btnDown = false; btnChange = now; onPress(now - btnSince >= 1000); }
+      else if (!down && btnDown && now - btnChange > 40) {
+        btnDown = false; btnChange = now;
+        if (now - btnSince >= 1000) { pendingShort = false; onPress(true); }
+        else if (ringing || timerDone || !(cdOn || swOn)) onPress(false);
+        else if (pendingShort && now - pendingAt < 450) { pendingShort = false; onDouble(); }
+        else { pendingShort = true; pendingAt = now; }
+      }
     }
 
     void updateBuzzer(unsigned long now) {
       if (heldBuz < 0) return;
       bool want = false;
-      if (ringing) want = ((now / 250) % 2) == 0;
+      if (ringing || timerDone) want = ((now / 250) % 2) == 0;
       else if (chimeBeepStart) {
         unsigned long t = now - chimeBeepStart;
         if (t >= 600) chimeBeepStart = 0; else want = (t < 200) || (t >= 400);
@@ -466,16 +542,16 @@ class UsermodAshishClock7Seg : public Usermod {
 
     bool tempUsable() const { return tempShow && tempC > -90.0f && ((tempSource == 0 && rtcReady && rtcChip == 1) || (tempSource == 1 && bmpReady)); }
 
-    uint8_t displayState() {   // 0 time, 1 day+month, 2 year, 3 temperature
+    uint8_t displayState() {   // 0 time, 1 day+month, 2 year, 3 temperature, 5 battery warning
       if (peekStart) {
         unsigned long e = millis() - peekStart;
         if (e < 3000) return 1;
         if (e < 5000) return 2;
         peekStart = 0;
       }
-      bool useDate = dateShow, useTemp = tempUsable();
-      if (!useDate && !useTemp) return 0;
-      uint16_t cyc = secTime + (useDate ? secDayMonth + secYear : 0) + (useTemp ? secTemp : 0);
+      bool useDate = dateShow, useTemp = tempUsable(), useWarn = rtcWarn && warnShow;
+      if (!useDate && !useTemp && !useWarn) return 0;
+      uint16_t cyc = secTime + (useDate ? secDayMonth + secYear : 0) + (useTemp ? secTemp : 0) + (useWarn ? 2 : 0);
       uint16_t p = (uint32_t)localTime % cyc;
       if (p < secTime) return 0;
       p -= secTime;
@@ -485,7 +561,11 @@ class UsermodAshishClock7Seg : public Usermod {
         if (p < secYear) return 2;
         p -= secYear;
       }
-      return 3;
+      if (useTemp) {
+        if (p < secTemp) return 3;
+        p -= secTemp;
+      }
+      return 5;
     }
 
     int tempShown() const {
@@ -516,6 +596,17 @@ class UsermodAshishClock7Seg : public Usermod {
       }
 
       uint8_t v[6] = {10,10,10,10,10,10};
+      if (timerMode) {                                        // countdown / stopwatch display
+        uint32_t el = timerElapsedSec();
+        uint32_t val = (timerMode == 1) ? (((uint32_t)cdMin * 60UL > el) ? (uint32_t)cdMin * 60UL - el : 0) : el;
+        uint8_t h = val / 3600, m = (val / 60) % 60, sc = val % 60;
+        if (mode == 0) { v[0] = h / 10; v[1] = h % 10; v[2] = m / 10; v[3] = m % 10; v[4] = sc / 10; v[5] = sc % 10; }
+        else if (val >= 3600) { v[0] = h / 10; v[1] = h % 10; v[2] = m / 10; v[3] = m % 10; }
+        else { v[0] = m / 10; v[1] = m % 10; v[2] = sc / 10; v[3] = sc % 10; }
+        colonOn = timerRunning || timerDone || (toki.getTime().ms < 500);   // paused: colon blinks
+        for (uint8_t i = 0; i < n; i++) patt[i] = PAT[v[i]];
+        return 4;
+      }
       uint8_t st = displayState();
       if (st == 0) {
         int h = hourFormat ? hourFormat12(t) : hour(t);
@@ -533,6 +624,9 @@ class UsermodAshishClock7Seg : public Usermod {
         int y = year(t);
         if (mode == 0) { v[0] = 10; v[1] = y / 1000; v[2] = (y / 100) % 10; v[3] = (y / 10) % 10; v[4] = y % 10; v[5] = 10; }
         else           { v[0] = y / 1000; v[1] = (y / 100) % 10; v[2] = (y / 10) % 10; v[3] = y % 10; }
+      } else if (st == 5) {                                   // RTC battery / time problem: bAtt
+        if (mode == 0) { v[0] = 10; v[1] = 15; v[2] = 16; v[3] = 17; v[4] = 17; v[5] = 10; }
+        else           { v[0] = 15; v[1] = 16; v[2] = 17; v[3] = 17; }
       } else {
         int tv = tempShown(); bool neg = tv < 0; int a = abs(tv); if (a > 99) a = 99;
         uint8_t tens = a / 10, ones = a % 10, unitCh = tempUnit ? 14 : 13;
@@ -553,7 +647,7 @@ class UsermodAshishClock7Seg : public Usermod {
       sig = sig * 131 + wdm;
       sig = sig * 5 + ampmMask;
       sig = sig * 3 + (inNight() ? 1 + nightAction : 0);
-      sig = sig * 3 + (ringing ? 1 + ((millis() / 500) % 2) : 0);
+      sig = sig * 3 + ((ringing || timerDone) ? 1 + ((millis() / 500) % 2) : 0);
       return sig;
     }
 
@@ -586,6 +680,7 @@ class UsermodAshishClock7Seg : public Usermod {
 
       // RTC maintenance
       if (rtcEnabled && rtcReady) {
+        if (now - lastBattCheck > 60000UL) { lastBattCheck = now; rtcCheckBattery(); }
         if (!rtcLoaded && now - lastRtcTry > 10000) { lastRtcTry = now; rtcLoadToWled(); }
 
         // internet time good? (WiFi up, NTP on, synced in the last ~12 h)
@@ -615,6 +710,7 @@ class UsermodAshishClock7Seg : public Usermod {
       }
 
       checkAlarmAndChime();
+      checkTimer(now);
       if (ringing && (long)(now - ringEnd) >= 0) ringing = false;
 
       if (!enabled) return;
@@ -631,8 +727,8 @@ class UsermodAshishClock7Seg : public Usermod {
       uint16_t endLed = firstLed + ledsNeeded();
       if (endLed > total) endLed = total;
 
-      bool night = inNight() && !testMode;
-      bool ringBlank = ringing && ((millis() / 500) % 2) == 1;
+      bool night = inNight() && !testMode && timerMode == 0;
+      bool ringBlank = (ringing || timerDone) && ((millis() / 500) % 2) == 1;
       if (ringBlank || (night && nightAction == 0)) {
         for (uint16_t i = firstLed; i < endLed; i++) strip.setPixelColor(i, 0);
         return;
@@ -644,7 +740,16 @@ class UsermodAshishClock7Seg : public Usermod {
       uint32_t dcol = 0;
       bool hasDigitCol = false;
       if (st == 1 || st == 2) hasDigitCol = parseHex(dateHex, dcol);
-      else if (st == 3)       hasDigitCol = parseHex(tempHex, dcol);
+      else if (st == 3) {
+        hasDigitCol = parseHex(tempHex, dcol);
+        if (!hasDigitCol && tempAutoColor) {                  // blue under 18 C, red over 30 C, else green
+          float tc = tempC + tempOffset;
+          dcol = tc < 18.0f ? 0x0066FF : (tc > 30.0f ? 0xFF0000 : 0x00FF00);
+          hasDigitCol = true;
+        }
+      }
+      else if (st == 4) hasDigitCol = parseHex(timerHex, dcol);
+      else if (st == 5) { dcol = 0xFF0000; hasDigitCol = true; }
 
       // digits
       for (uint8_t d = 0; d < n; d++) {
@@ -769,6 +874,22 @@ class UsermodAshishClock7Seg : public Usermod {
       else if (rereadCount == 0) { snprintf(b, sizeof(b), "every %d min, waiting", rereadMin); a5b.add(String(b)); }
       else { snprintf(b, sizeof(b), "every %d min, last diff %ld s", rereadMin, (long)rtcDiff); a5b.add(String(b)); }
 
+      // 5c) RTC battery / time warning
+      JsonArray a5c = user.createNestedArray(F("Clock RTC battery"));
+      if (!rtcEnabled || !rtcReady) a5c.add(F("n/a"));
+      else if (rtcWarn) a5c.add(F("WARNING: time lost - replace CR2032 / set time"));
+      else a5c.add(F("OK (time valid)"));
+
+      // 5d) Countdown / stopwatch
+      JsonArray a5d = user.createNestedArray(F("Clock timer"));
+      if (timerMode == 0) a5d.add(F("off (double press button)"));
+      else {
+        uint32_t el = timerElapsedSec();
+        uint32_t val = (timerMode == 1) ? (((uint32_t)cdMin * 60UL > el) ? (uint32_t)cdMin * 60UL - el : 0) : el;
+        snprintf(b, sizeof(b), "%s %02d:%02d:%02d %s", timerMode == 1 ? "countdown" : "stopwatch", (int)(val / 3600), (int)((val / 60) % 60), (int)(val % 60), timerDone ? "DONE" : (timerRunning ? "running" : "paused"));
+        a5d.add(String(b));
+      }
+
       // 6) Temperature
       JsonArray a6 = user.createNestedArray(F("Clock temperature"));
       if (tempSource == 1) {
@@ -797,7 +918,7 @@ class UsermodAshishClock7Seg : public Usermod {
       a8.add(ledsNeeded() + firstLed);
       a8.add(strip.getLengthTotal() >= ledsNeeded() + firstLed ? F(" (strip OK)") : F(" - raise LED count in LED Preferences!"));
 
-      if (orderBad) { JsonArray a9 = user.createNestedArray(F("Clock seg order")); a9.add(F("invalid - using FABCDEG")); }
+      if (orderBad) { JsonArray a9 = user.createNestedArray(F("Clock seg order")); a9.add(F("invalid - using FABGEDC")); }
     }
 
     void addToJsonState(JsonObject& root) {
@@ -805,6 +926,8 @@ class UsermodAshishClock7Seg : public Usermod {
       o[F("test")] = testMode;
       o[F("date")] = dateShow;
       o[F("on")]   = enabled;
+      o[F("timer")] = timerMode;      // 0 clock, 1 countdown, 2 stopwatch
+      o[F("run")]  = timerRunning;
     }
 
     void readFromJsonState(JsonObject& root) {
@@ -813,6 +936,14 @@ class UsermodAshishClock7Seg : public Usermod {
       testMode = o[F("test")] | testMode;
       dateShow = o[F("date")] | dateShow;
       enabled  = o[F("on")]   | enabled;
+      if (!o[F("timer")].isNull()) {                 // {"clk7":{"timer":1,"run":true}} starts the countdown
+        uint8_t m = o[F("timer")] | 0;
+        if (m != timerMode) { if (m == 0) exitTimer(); else if ((m == 1 && cdOn) || (m == 2 && swOn)) enterTimer(m); }
+      }
+      if (!o[F("run")].isNull() && timerMode && !timerDone) {
+        bool r = o[F("run")] | timerRunning;
+        if (r != timerRunning) timerToggle();
+      }
     }
 
     // ---------- settings page ----------
@@ -852,6 +983,7 @@ class UsermodAshishClock7Seg : public Usermod {
       JsonObject tp = top.createNestedObject(F("temperature"));
       tp[F("show")] = tempShow;
       tp[F("source")] = tempSource;
+      tp[F("auto-color")] = tempAutoColor;
       tp[F("unit")] = tempUnit;
       tp[F("temp-sec")] = secTemp;
       tp[F("offset")] = tempOffset;
@@ -860,6 +992,7 @@ class UsermodAshishClock7Seg : public Usermod {
       c[F("weekday-hex")] = wdHex;
       c[F("other-days-hex")] = otherHex;
       c[F("weekend-hex")] = weekendHex;
+      c[F("timer-hex")] = timerHex;
       c[F("colon-hex")] = colonHex;
       c[F("date-hex")] = dateHex;
       c[F("temp-hex")] = tempHex;
@@ -881,6 +1014,12 @@ class UsermodAshishClock7Seg : public Usermod {
       bz[F("buzzer-pin")] = buzzerPin;
       bz[F("buzzer-invert")] = buzzerInvert;
       bz[F("button-pin")] = buttonPin;
+
+      JsonObject tm = top.createNestedObject(F("timer"));
+      tm[F("countdown-on")] = cdOn;
+      tm[F("countdown-min")] = cdMin;
+      tm[F("stopwatch-on")] = swOn;
+      tm[F("end-beep-sec")] = timerRingSec;
 
       JsonObject n = top.createNestedObject(F("night"));
       n[F("enabled")] = nightOn;
@@ -904,6 +1043,7 @@ class UsermodAshishClock7Seg : public Usermod {
       r[F("sync-hours")] = rtcSyncHours;
       r[F("reread-on")] = rereadOn;
       r[F("reread-min")] = rereadMin;
+      r[F("warn-display")] = warnShow;
 
       JsonObject t = top.createNestedObject(F("test"));
       t[F("mode")] = testMode;
@@ -919,7 +1059,7 @@ class UsermodAshishClock7Seg : public Usermod {
       JsonObject w = top[F("wiring")];
       ok &= getJsonValue(w[F("first-led")], firstLed, (uint16_t)0);
       ok &= getJsonValue(w[F("seg-preset")], segPreset, (uint8_t)1);
-      copyStr(segCustom, sizeof(segCustom), w[F("seg-order")] | "FABCDEG");
+      copyStr(segCustom, sizeof(segCustom), w[F("seg-order")] | "FABGEDC");
       ok &= getJsonValue(w[F("leds-per-segment")], ledsPerSeg, (uint8_t)1);
       ok &= getJsonValue(w[F("leds-per-colon")], colonLeds, (uint8_t)2);
       ok &= getJsonValue(w[F("leds-per-weekday")], ledsPerDay, (uint8_t)1);
@@ -949,6 +1089,7 @@ class UsermodAshishClock7Seg : public Usermod {
       JsonObject tp = top[F("temperature")];
       ok &= getJsonValue(tp[F("show")], tempShow, false);
       ok &= getJsonValue(tp[F("source")], tempSource, (uint8_t)0);
+      ok &= getJsonValue(tp[F("auto-color")], tempAutoColor, false);
       ok &= getJsonValue(tp[F("unit")], tempUnit, (uint8_t)0);
       ok &= getJsonValue(tp[F("temp-sec")], secTemp, (uint8_t)2);
       ok &= getJsonValue(tp[F("offset")], tempOffset, (int8_t)0);
@@ -957,6 +1098,7 @@ class UsermodAshishClock7Seg : public Usermod {
       copyStr(wdHex, sizeof(wdHex), c[F("weekday-hex")] | "");
       copyStr(otherHex, sizeof(otherHex), c[F("other-days-hex")] | "");
       copyStr(weekendHex, sizeof(weekendHex), c[F("weekend-hex")] | "");
+      copyStr(timerHex, sizeof(timerHex), c[F("timer-hex")] | "");
       copyStr(colonHex, sizeof(colonHex), c[F("colon-hex")] | "");
       copyStr(dateHex, sizeof(dateHex), c[F("date-hex")] | "");
       copyStr(tempHex, sizeof(tempHex), c[F("temp-hex")] | "");
@@ -980,6 +1122,12 @@ class UsermodAshishClock7Seg : public Usermod {
       ok &= getJsonValue(bz[F("buzzer-invert")], buzzerInvert, false);
       ok &= getJsonValue(bz[F("button-pin")], buttonPin, (int8_t)-1);
 
+      JsonObject tm = top[F("timer")];
+      ok &= getJsonValue(tm[F("countdown-on")], cdOn, true);
+      ok &= getJsonValue(tm[F("countdown-min")], cdMin, (uint8_t)10);
+      ok &= getJsonValue(tm[F("stopwatch-on")], swOn, true);
+      ok &= getJsonValue(tm[F("end-beep-sec")], timerRingSec, (uint8_t)10);
+
       JsonObject n = top[F("night")];
       ok &= getJsonValue(n[F("enabled")], nightOn, false);
       ok &= getJsonValue(n[F("start-hour")], nightStart, (uint8_t)23);
@@ -1002,6 +1150,7 @@ class UsermodAshishClock7Seg : public Usermod {
       ok &= getJsonValue(r[F("sync-hours")], rtcSyncHours, (uint8_t)6);
       ok &= getJsonValue(r[F("reread-on")], rereadOn, true);
       ok &= getJsonValue(r[F("reread-min")], rereadMin, (uint8_t)5);
+      ok &= getJsonValue(r[F("warn-display")], warnShow, true);
 
       JsonObject t = top[F("test")];
       ok &= getJsonValue(t[F("mode")], testMode, (uint8_t)0);
@@ -1012,10 +1161,11 @@ class UsermodAshishClock7Seg : public Usermod {
       ledsPerSeg = constrain(ledsPerSeg, 1, 10);
       colonLeds  = constrain(colonLeds, 1, 6);
       weekdayMode = weekdayMode > 2 ? 1 : weekdayMode;
+      cdMin = constrain(cdMin, 1, 99); timerRingSec = constrain(timerRingSec, 3, 60);
       ampmLeds = constrain(ampmLeds, 1, 6); tempSource = tempSource ? 1 : 0; rereadMin = constrain(rereadMin, 1, 60);
       nightAction = nightAction ? 1 : 0; nightDim = constrain(nightDim, 1, 100);
       ledsPerDay = constrain(ledsPerDay, 1, 5);
-      segPreset  = segPreset > 4 ? 1 : segPreset;
+      segPreset  = segPreset > 3 ? 1 : segPreset;
       dateOrder  = dateOrder ? 1 : 0;
       secTime = constrain(secTime, 1, 60); secDayMonth = constrain(secDayMonth, 1, 30); secYear = constrain(secYear, 1, 30);
       secTemp = constrain(secTemp, 1, 30);
@@ -1030,12 +1180,13 @@ class UsermodAshishClock7Seg : public Usermod {
 
       configRead = true;
       lastSig = 0xFFFFFFFF;
-      alarmKey = 0; snoozeAt = 0; ringing = false; alarmArmed = true; lastReread = millis();
+      alarmKey = 0; snoozeAt = 0; ringing = false; alarmArmed = true; lastReread = millis(); exitTimer();
       if (setupDone) { buildOrder(); initHw(); }
       return ok;
     }
 
     void appendConfigData() {
+      oappend(F("(function(){var h=document.getElementsByTagName('h2')[0],t=document.getElementsByTagName('h3');for(var i=0;i<t.length;i++){if(t[i].textContent.trim()=='Ashish Automation'){t[i].style.fontSize=h?getComputedStyle(h).fontSize:'1.5em';t[i].style.fontWeight='bold';}}})();"));
       oappend(F("dd=addDropdown('Ashish Automation:display','mode');"));
       oappend(F("addOption(dd,'HH:MM:SS (6 digits)',0);addOption(dd,'HH:MM (4 digits)',1);"));
       oappend(F("dd=addDropdown('Ashish Automation:display','hour-format');"));
@@ -1043,7 +1194,7 @@ class UsermodAshishClock7Seg : public Usermod {
       oappend(F("dd=addDropdown('Ashish Automation:display','weekday-mode');"));
       oappend(F("addOption(dd,'Off',0);addOption(dd,'Today only',1);addOption(dd,'All on, today different',2);"));
       oappend(F("dd=addDropdown('Ashish Automation:wiring','seg-preset');"));
-      oappend(F("addOption(dd,'Custom (use Seg Order)',0);addOption(dd,'F-A-B-C-D-E-G (default)',1);addOption(dd,'A-B-C-D-E-F-G',2);addOption(dd,'G-F-E-D-C-B-A',3);addOption(dd,'G-A-B-C-D-E-F',4);"));
+      oappend(F("addOption(dd,'Custom (use Seg Order)',0);addOption(dd,'F-A-B-G-E-D-C (default)',1);addOption(dd,'A-B-C-D-E-F-G',2);addOption(dd,'F-A-B-C-D-E-G',3);"));
       oappend(F("dd=addDropdown('Ashish Automation:date','order');"));
       oappend(F("addOption(dd,'Day then Month',0);addOption(dd,'Month then Day',1);"));
       oappend(F("dd=addDropdown('Ashish Automation:temperature','source');"));
@@ -1092,10 +1243,17 @@ class UsermodAshishClock7Seg : public Usermod {
       oappend(F("addInfo('Ashish Automation:am-pm-leds:pm-hex',1,'<br><small>RRGGBB, empty = main colour</small>');"));
       oappend(F("addInfo('Ashish Automation:rtc:reread-on',1,'<br><small>Fix drift when no internet time</small>');"));
       oappend(F("addInfo('Ashish Automation:rtc:reread-min',1,'<br><small>1 to 60 minutes</small>');"));
+          oappend(F("addInfo('Ashish Automation:temperature:auto-color',1,'<br><small>Blue under 18C, green, red over 30C</small>');"));
+      oappend(F("addInfo('Ashish Automation:colors:timer-hex',1,'<br><small>Countdown / stopwatch. RRGGBB</small>');"));
+      oappend(F("addInfo('Ashish Automation:timer:countdown-on',1,'<br><small>Double press button to open</small>');"));
+      oappend(F("addInfo('Ashish Automation:timer:countdown-min',1,'<br><small>1 to 99 minutes</small>');"));
+      oappend(F("addInfo('Ashish Automation:timer:stopwatch-on',1,'<br><small>Double press button twice</small>');"));
+      oappend(F("addInfo('Ashish Automation:timer:end-beep-sec',1,'<br><small>3 to 60 s of beeps at the end</small>');"));
+      oappend(F("addInfo('Ashish Automation:rtc:warn-display',1,'<br><small>Shows bAtt if time lost / battery</small>');"));
     }
 
     uint16_t getId() { return USERMOD_ID_UNSPECIFIED; }
 };
 
 const char UsermodAshishClock7Seg::_name[] PROGMEM = "Ashish Automation";
-constexpr uint8_t UsermodAshishClock7Seg::PAT[15];
+constexpr uint8_t UsermodAshishClock7Seg::PAT[18];
