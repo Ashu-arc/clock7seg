@@ -15,6 +15,15 @@
 
 #include "wled.h"
 
+// works on WLED 0.14.4 (VERSION 2405180) and WLED 0.15.0 (VERSION 2412100)
+#if VERSION >= 2410000
+  #define C7_PM PinManager::
+  #define C7_OAPPEND(x) oappend(F(x))
+#else
+  #define C7_PM pinManager.
+  #define C7_OAPPEND(x) oappend(SET_F(x))
+#endif
+
 #ifdef ESP8266
   #define C7_DEF_SDA 4    // D2
   #define C7_DEF_SCL 5    // D1
@@ -45,6 +54,8 @@ class UsermodAshishClock7Seg : public Usermod {
     uint8_t colonLeds    = 2;      // 1..6 LEDs PER colon
     uint8_t ledsPerDay   = 1;      // 1..5
     bool    ampmOn       = false;  // AM / PM LEDs after the weekday LEDs
+    bool    ampmBlink    = false;  // the lit AM/PM LED blinks
+    bool    blankExtra   = true;   // turn off LEDs after the clock chain
     uint8_t ampmLeds     = 1;      // 1..6 LEDs for AM, same for PM
 
     bool    dateShow     = false;
@@ -102,6 +113,7 @@ class UsermodAshishClock7Seg : public Usermod {
     char    timerHex[10] = "";
     bool    tempAutoColor = false; // blue cold, green normal, red hot
     bool    warnShow     = true;   // show bAtt when RTC battery/time problem
+    bool    battCheck    = true;   // RTC battery / time check on or off
     bool    rtcEnabled   = true;
     uint8_t rtcChip      = 0;      // 0 = DS1307, 1 = DS3231
     int8_t  rtcSda       = C7_DEF_SDA;
@@ -255,8 +267,9 @@ class UsermodAshishClock7Seg : public Usermod {
       if (i2cReadRegs(C7_RTC_ADDR, 0x0F, &st, 1)) rtcOsf = (st & 0x80) != 0;
     }
     void rtcClearOsf() { if (i2cWriteReg(C7_RTC_ADDR, 0x0F, 0x00)) rtcOsf = false; }
-    void updateRtcWarn() { rtcWarn = rtcEnabled && rtcReady && (rtcInvalid || (rtcChip == 1 && rtcOsf)); }
+    void updateRtcWarn() { rtcWarn = battCheck && rtcEnabled && rtcReady && (rtcInvalid || (rtcChip == 1 && rtcOsf)); }
     void rtcCheckBattery() {
+      if (!battCheck) { rtcWarn = false; return; }
       time_t tmp;
       rtcRead(tmp);                                            // updates rtcInvalid
       if (rtcChip == 1) rtcReadOsf();
@@ -288,11 +301,11 @@ class UsermodAshishClock7Seg : public Usermod {
 
     // ---------- pins / hardware ----------
     void releasePins() {
-      if (heldSda >= 0) { PinManager::deallocatePin(heldSda, PinOwner::UM_Unspecified); heldSda = -1; }
-      if (heldScl >= 0) { PinManager::deallocatePin(heldScl, PinOwner::UM_Unspecified); heldScl = -1; }
-      if (heldLdr >= 0) { PinManager::deallocatePin(heldLdr, PinOwner::UM_Unspecified); heldLdr = -1; }
-      if (heldBuz >= 0) { digitalWrite(heldBuz, buzzerInvert ? HIGH : LOW); PinManager::deallocatePin(heldBuz, PinOwner::UM_Unspecified); heldBuz = -1; }
-      if (heldBtn >= 0) { PinManager::deallocatePin(heldBtn, PinOwner::UM_Unspecified); heldBtn = -1; }
+      if (heldSda >= 0) { C7_PM deallocatePin(heldSda, PinOwner::UM_Unspecified); heldSda = -1; }
+      if (heldScl >= 0) { C7_PM deallocatePin(heldScl, PinOwner::UM_Unspecified); heldScl = -1; }
+      if (heldLdr >= 0) { C7_PM deallocatePin(heldLdr, PinOwner::UM_Unspecified); heldLdr = -1; }
+      if (heldBuz >= 0) { digitalWrite(heldBuz, buzzerInvert ? HIGH : LOW); C7_PM deallocatePin(heldBuz, PinOwner::UM_Unspecified); heldBuz = -1; }
+      if (heldBtn >= 0) { C7_PM deallocatePin(heldBtn, PinOwner::UM_Unspecified); heldBtn = -1; }
     }
 
     // ---------- BMP280 / BME280 (temperature + pressure, I2C 0x76 or 0x77) ----------
@@ -371,7 +384,7 @@ class UsermodAshishClock7Seg : public Usermod {
         bool ok = true;
         if (!sameAsGlobal) {
           managed_pin_type p[2] = { {(int8_t)rtcSda, true}, {(int8_t)rtcScl, true} };
-          if (PinManager::allocateMultiplePins(p, 2, PinOwner::UM_Unspecified)) { heldSda = rtcSda; heldScl = rtcScl; }
+          if (C7_PM allocateMultiplePins(p, 2, PinOwner::UM_Unspecified)) { heldSda = rtcSda; heldScl = rtcScl; }
           else { ok = false; rtcPinError = true; }
         }
         if (ok) {
@@ -385,13 +398,13 @@ class UsermodAshishClock7Seg : public Usermod {
       }
       #ifndef ESP8266
       if (autoBri && ldrPin >= 0) {
-        if (PinManager::allocatePin(ldrPin, false, PinOwner::UM_Unspecified)) heldLdr = ldrPin;
+        if (C7_PM allocatePin(ldrPin, false, PinOwner::UM_Unspecified)) heldLdr = ldrPin;
       }
       #endif
-      if (buzzerPin >= 0 && PinManager::allocatePin(buzzerPin, true, PinOwner::UM_Unspecified)) {
+      if (buzzerPin >= 0 && C7_PM allocatePin(buzzerPin, true, PinOwner::UM_Unspecified)) {
         heldBuz = buzzerPin; pinMode(heldBuz, OUTPUT); digitalWrite(heldBuz, buzzerInvert ? HIGH : LOW);
       }
-      if (buttonPin >= 0 && PinManager::allocatePin(buttonPin, false, PinOwner::UM_Unspecified)) {
+      if (buttonPin >= 0 && C7_PM allocatePin(buttonPin, false, PinOwner::UM_Unspecified)) {
         heldBtn = buttonPin; pinMode(heldBtn, INPUT_PULLUP);
       }
     }
@@ -583,6 +596,7 @@ class UsermodAshishClock7Seg : public Usermod {
       uint8_t wd = weekday(t);                                // 1 = Sunday
       if (wd >= 1 && wd <= 7) wdMask = 1 << (wd - 1);
       ampmMask = (hour(t) >= 12) ? 2 : 1;                     // bit0 = AM, bit1 = PM
+      if (ampmBlink && toki.getTime().ms >= 500) ampmMask = 0;  // blink: off in the second half of each second
 
       uint8_t tm = testMode;
       if (!tm && bootTestUntil) { if ((long)(bootTestUntil - millis()) > 0) tm = 1; else bootTestUntil = 0; }
@@ -680,7 +694,7 @@ class UsermodAshishClock7Seg : public Usermod {
 
       // RTC maintenance
       if (rtcEnabled && rtcReady) {
-        if (now - lastBattCheck > 60000UL) { lastBattCheck = now; rtcCheckBattery(); }
+        if (battCheck && now - lastBattCheck > 60000UL) { lastBattCheck = now; rtcCheckBattery(); }
         if (!rtcLoaded && now - lastRtcTry > 10000) { lastRtcTry = now; rtcLoadToWled(); }
 
         // internet time good? (WiFi up, NTP on, synced in the last ~12 h)
@@ -725,6 +739,7 @@ class UsermodAshishClock7Seg : public Usermod {
       uint16_t total = strip.getLengthTotal();
       uint8_t n = digitCount();
       uint16_t endLed = firstLed + ledsNeeded();
+      if (blankExtra) { for (uint16_t i = endLed; i < total; i++) strip.setPixelColor(i, 0); }   // LEDs after the clock chain stay off
       if (endLed > total) endLed = total;
 
       bool night = inNight() && !testMode && timerMode == 0;
@@ -876,7 +891,8 @@ class UsermodAshishClock7Seg : public Usermod {
 
       // 5c) RTC battery / time warning
       JsonArray a5c = user.createNestedArray(F("Clock RTC battery"));
-      if (!rtcEnabled || !rtcReady) a5c.add(F("n/a"));
+      if (!battCheck) a5c.add(F("check is OFF"));
+      else if (!rtcEnabled || !rtcReady) a5c.add(F("n/a"));
       else if (rtcWarn) a5c.add(F("WARNING: time lost - replace CR2032 / set time"));
       else a5c.add(F("OK (time valid)"));
 
@@ -917,6 +933,13 @@ class UsermodAshishClock7Seg : public Usermod {
       JsonArray a8 = user.createNestedArray(F("Clock LEDs needed"));
       a8.add(ledsNeeded() + firstLed);
       a8.add(strip.getLengthTotal() >= ledsNeeded() + firstLed ? F(" (strip OK)") : F(" - raise LED count in LED Preferences!"));
+      {
+        uint16_t maxNeed = firstLed + 6 * 7 * ledsPerSeg + 2 * colonLeds + 7 * ledsPerDay + (ampmOn ? 2 * ampmLeds : 0);
+        JsonArray a8b = user.createNestedArray(F("Clock LEDs max"));
+        snprintf(b, sizeof(b), "%d", (int)maxNeed);
+        a8b.add(String(b));
+        a8b.add(F(" (6 digits). Set this as LED count to switch modes freely"));
+      }
 
       if (orderBad) { JsonArray a9 = user.createNestedArray(F("Clock seg order")); a9.add(F("invalid - using FABGEDC")); }
     }
@@ -958,12 +981,14 @@ class UsermodAshishClock7Seg : public Usermod {
       w[F("leds-per-segment")] = ledsPerSeg;
       w[F("leds-per-colon")] = colonLeds;
       w[F("leds-per-weekday")] = ledsPerDay;
+      w[F("blank-extra")] = blankExtra;
 
       JsonObject ap = top.createNestedObject(F("am-pm-leds"));
       ap[F("enabled")] = ampmOn;
       ap[F("leds-each")] = ampmLeds;
       ap[F("am-hex")] = amHex;
       ap[F("pm-hex")] = pmHex;
+      ap[F("blink")] = ampmBlink;
 
       JsonObject d = top.createNestedObject(F("display"));
       d[F("mode")] = mode;
@@ -1043,6 +1068,7 @@ class UsermodAshishClock7Seg : public Usermod {
       r[F("sync-hours")] = rtcSyncHours;
       r[F("reread-on")] = rereadOn;
       r[F("reread-min")] = rereadMin;
+      r[F("battery-check")] = battCheck;
       r[F("warn-display")] = warnShow;
 
       JsonObject t = top.createNestedObject(F("test"));
@@ -1063,12 +1089,14 @@ class UsermodAshishClock7Seg : public Usermod {
       ok &= getJsonValue(w[F("leds-per-segment")], ledsPerSeg, (uint8_t)1);
       ok &= getJsonValue(w[F("leds-per-colon")], colonLeds, (uint8_t)2);
       ok &= getJsonValue(w[F("leds-per-weekday")], ledsPerDay, (uint8_t)1);
+      ok &= getJsonValue(w[F("blank-extra")], blankExtra, true);
 
       JsonObject ap = top[F("am-pm-leds")];
       ok &= getJsonValue(ap[F("enabled")], ampmOn, false);
       ok &= getJsonValue(ap[F("leds-each")], ampmLeds, (uint8_t)1);
       copyStr(amHex, sizeof(amHex), ap[F("am-hex")] | "");
       copyStr(pmHex, sizeof(pmHex), ap[F("pm-hex")] | "");
+      ok &= getJsonValue(ap[F("blink")], ampmBlink, false);
       if (ap.isNull()) ok = false;
 
       JsonObject d = top[F("display")];
@@ -1150,6 +1178,7 @@ class UsermodAshishClock7Seg : public Usermod {
       ok &= getJsonValue(r[F("sync-hours")], rtcSyncHours, (uint8_t)6);
       ok &= getJsonValue(r[F("reread-on")], rereadOn, true);
       ok &= getJsonValue(r[F("reread-min")], rereadMin, (uint8_t)5);
+      ok &= getJsonValue(r[F("battery-check")], battCheck, true);
       ok &= getJsonValue(r[F("warn-display")], warnShow, true);
 
       JsonObject t = top[F("test")];
@@ -1186,70 +1215,33 @@ class UsermodAshishClock7Seg : public Usermod {
     }
 
     void appendConfigData() {
-      oappend(F("(function(){var h=document.getElementsByTagName('h2')[0],t=document.getElementsByTagName('h3');for(var i=0;i<t.length;i++){if(t[i].textContent.trim()=='Ashish Automation'){t[i].style.fontSize=h?getComputedStyle(h).fontSize:'1.5em';t[i].style.fontWeight='bold';}}})();"));
-      oappend(F("dd=addDropdown('Ashish Automation:display','mode');"));
-      oappend(F("addOption(dd,'HH:MM:SS (6 digits)',0);addOption(dd,'HH:MM (4 digits)',1);"));
-      oappend(F("dd=addDropdown('Ashish Automation:display','hour-format');"));
-      oappend(F("addOption(dd,'24 hour',0);addOption(dd,'12 hour',1);"));
-      oappend(F("dd=addDropdown('Ashish Automation:display','weekday-mode');"));
-      oappend(F("addOption(dd,'Off',0);addOption(dd,'Today only',1);addOption(dd,'All on, today different',2);"));
-      oappend(F("dd=addDropdown('Ashish Automation:wiring','seg-preset');"));
-      oappend(F("addOption(dd,'Custom (use Seg Order)',0);addOption(dd,'F-A-B-G-E-D-C (default)',1);addOption(dd,'A-B-C-D-E-F-G',2);addOption(dd,'F-A-B-C-D-E-G',3);"));
-      oappend(F("dd=addDropdown('Ashish Automation:date','order');"));
-      oappend(F("addOption(dd,'Day then Month',0);addOption(dd,'Month then Day',1);"));
-      oappend(F("dd=addDropdown('Ashish Automation:temperature','source');"));
-      oappend(F("addOption(dd,'DS3231 RTC sensor',0);addOption(dd,'BMP280 sensor',1);"));
-      oappend(F("dd=addDropdown('Ashish Automation:temperature','unit');"));
-      oappend(F("addOption(dd,'Celsius (C)',0);addOption(dd,'Fahrenheit (F)',1);"));
-      oappend(F("dd=addDropdown('Ashish Automation:alarm','days');"));
-      oappend(F("addOption(dd,'Every day',0);addOption(dd,'Mon to Fri',1);addOption(dd,'Sat and Sun',2);"));
-      oappend(F("dd=addDropdown('Ashish Automation:night','action');"));
-      oappend(F("addOption(dd,'Display off',0);addOption(dd,'Dim',1);"));
-      oappend(F("dd=addDropdown('Ashish Automation:rtc','chip');"));
-      oappend(F("addOption(dd,'DS1307',0);addOption(dd,'DS3231 (has temp)',1);"));
-      oappend(F("dd=addDropdown('Ashish Automation:test','mode');"));
-      oappend(F("addOption(dd,'Off (normal clock)',0);addOption(dd,'All segments ON',1);addOption(dd,'Segment walk A to G',2);addOption(dd,'Digits 0-9 count',3);"));
-
-      oappend(F("addInfo('Ashish Automation:wiring:first-led',1,'<br><small>LED number of digit 1 (0 = first)</small>');"));
-      oappend(F("addInfo('Ashish Automation:wiring:seg-order',1,'<br><small>Only if preset = Custom. Letters A-G</small>');"));
-      oappend(F("addInfo('Ashish Automation:wiring:leds-per-segment',1,'<br><small>1 to 10</small>');"));
-      oappend(F("addInfo('Ashish Automation:wiring:leds-per-colon',1,'<br><small>1 to 6 LEDs in ONE colon</small>');"));
-      oappend(F("addInfo('Ashish Automation:wiring:leds-per-weekday',1,'<br><small>1 to 5</small>');"));
-      oappend(F("addInfo('Ashish Automation:display:weekday-mode',1,'<br><small>All on: today = Weekday Hex (red)</small>');"));
-      oappend(F("addInfo('Ashish Automation:display:startup-test',1,'<br><small>All LEDs ON for 3 s at power on</small>');"));
-      oappend(F("addInfo('Ashish Automation:temperature:show',1,'<br><small>Needs DS3231 RTC</small>');"));
-      oappend(F("addInfo('Ashish Automation:temperature:offset',1,'<br><small>Degrees C added (-9 to 9)</small>');"));
-      oappend(F("addInfo('Ashish Automation:colors:weekday-hex',1,'<br><small>Today colour. RRGGBB, empty = main</small>');"));
-      oappend(F("addInfo('Ashish Automation:colors:other-days-hex',1,'<br><small>Other 6 days. RRGGBB, empty = main</small>');"));
-      oappend(F("addInfo('Ashish Automation:colors:colon-hex',1,'<br><small>RRGGBB, empty = main colour</small>');"));
-      oappend(F("addInfo('Ashish Automation:colors:date-hex',1,'<br><small>Date and year. RRGGBB</small>');"));
-      oappend(F("addInfo('Ashish Automation:colors:temp-hex',1,'<br><small>Temperature. RRGGBB</small>');"));
-      oappend(F("addInfo('Ashish Automation:alarm:ring-sec',1,'<br><small>5 to 255 seconds</small>');"));
-      oappend(F("addInfo('Ashish Automation:alarm:snooze-min',1,'<br><small>0 = no snooze</small>');"));
-      oappend(F("addInfo('Ashish Automation:hourly-chime:start-hour',1,'<br><small>0-23, first chime</small>');"));
-      oappend(F("addInfo('Ashish Automation:hourly-chime:end-hour',1,'<br><small>0-23, last chime</small>');"));
-      oappend(F("addInfo('Ashish Automation:buzzer-button:buzzer-pin',1,'<br><small>Active buzzer</small>');"));
-      oappend(F("addInfo('Ashish Automation:buzzer-button:button-pin',1,'<br><small>Button to GND</small>');"));
-      oappend(F("addInfo('Ashish Automation:night:start-hour',1,'<br><small>0-23, night starts</small>');"));
-      oappend(F("addInfo('Ashish Automation:night:end-hour',1,'<br><small>0-23, night ends</small>');"));
-      oappend(F("addInfo('Ashish Automation:night:dim-percent',1,'<br><small>1-100, used when Action = Dim</small>');"));
-      oappend(F("addInfo('Ashish Automation:brightness:ldr-pin',1,'<br><small>ESP32: 32-39. ESP8266: A0</small>');"));
-      oappend(F("addInfo('Ashish Automation:rtc:sync-hours',1,'<br><small>Copy net time to RTC (0 = once)</small>');"));
-          oappend(F("addInfo('Ashish Automation:temperature:source',1,'<br><small>BMP280 shares SDA/SCL with RTC</small>');"));
-      oappend(F("addInfo('Ashish Automation:colors:weekend-hex',1,'<br><small>Sun and Sat (mode All on)</small>');"));
-      oappend(F("addInfo('Ashish Automation:am-pm-leds:enabled',1,'<br><small>AM/PM LEDs go after weekdays</small>');"));
-      oappend(F("addInfo('Ashish Automation:am-pm-leds:leds-each',1,'<br><small>1 to 6 LEDs for AM, same for PM</small>');"));
-      oappend(F("addInfo('Ashish Automation:am-pm-leds:am-hex',1,'<br><small>RRGGBB, empty = main colour</small>');"));
-      oappend(F("addInfo('Ashish Automation:am-pm-leds:pm-hex',1,'<br><small>RRGGBB, empty = main colour</small>');"));
-      oappend(F("addInfo('Ashish Automation:rtc:reread-on',1,'<br><small>Fix drift when no internet time</small>');"));
-      oappend(F("addInfo('Ashish Automation:rtc:reread-min',1,'<br><small>1 to 60 minutes</small>');"));
-          oappend(F("addInfo('Ashish Automation:temperature:auto-color',1,'<br><small>Blue under 18C, green, red over 30C</small>');"));
-      oappend(F("addInfo('Ashish Automation:colors:timer-hex',1,'<br><small>Countdown / stopwatch. RRGGBB</small>');"));
-      oappend(F("addInfo('Ashish Automation:timer:countdown-on',1,'<br><small>Double press button to open</small>');"));
-      oappend(F("addInfo('Ashish Automation:timer:countdown-min',1,'<br><small>1 to 99 minutes</small>');"));
-      oappend(F("addInfo('Ashish Automation:timer:stopwatch-on',1,'<br><small>Double press button twice</small>');"));
-      oappend(F("addInfo('Ashish Automation:timer:end-beep-sec',1,'<br><small>3 to 60 s of beeps at the end</small>');"));
-      oappend(F("addInfo('Ashish Automation:rtc:warn-display',1,'<br><small>Shows bAtt if time lost / battery</small>');"));
+      // Kept small on purpose: WLED 0.14.4 on ESP8266 has only 2048 bytes for the whole settings script.
+      // Order = importance (list boxes first), so if space runs out only the last hints are dropped.
+      C7_OAPPEND("var U='Ashish Automation:',dd,c7d=function(g,f,o){try{dd=addDropdown(U+g,f);for(var i=0;i<o.length;i++)addOption(dd,o[i],i)}catch(e){}},c7i=function(g,f,t){try{addInfo(U+g+':'+f,1,'<br><small>'+t+'</small>')}catch(e){}};");
+      C7_OAPPEND("try{var h=document.getElementsByTagName('h2')[0],t=document.getElementsByTagName('h3');for(var i=0;i<t.length;i++)if(t[i].textContent.trim()=='Ashish Automation')t[i].style.fontSize=getComputedStyle(h).fontSize}catch(e){}");
+      C7_OAPPEND("c7d('display','mode',['6 digits HH:MM:SS','4 digits HH:MM']);");
+      C7_OAPPEND("c7d('display','weekday-mode',['Off','Today only','All on, today differs']);");
+      C7_OAPPEND("c7d('display','hour-format',['24 hour','12 hour']);");
+      C7_OAPPEND("c7d('wiring','seg-preset',['Custom','F-A-B-G-E-D-C (default)','A-B-C-D-E-F-G','F-A-B-C-D-E-G']);");
+      C7_OAPPEND("c7d('temperature','source',['DS3231','BMP280']);");
+      C7_OAPPEND("c7d('temperature','unit',['C','F']);");
+      C7_OAPPEND("c7d('date','order',['Day-Month','Month-Day']);");
+      C7_OAPPEND("c7d('alarm','days',['Every day','Mon-Fri','Sat-Sun']);");
+      C7_OAPPEND("c7d('night','action',['Off','Dim']);");
+      C7_OAPPEND("c7d('rtc','chip',['DS1307','DS3231']);");
+      C7_OAPPEND("c7d('test','mode',['Off','All ON','Seg walk','Digit count']);");
+      C7_OAPPEND("c7i('wiring','seg-order','Used if preset = Custom');");
+      C7_OAPPEND("c7i('wiring','leds-per-colon','LEDs in ONE colon');");
+      C7_OAPPEND("c7i('wiring','blank-extra','Extra LEDs stay off');");
+      C7_OAPPEND("c7i('am-pm-leds','leds-each','Same for AM and PM');");
+      C7_OAPPEND("c7i('colors','weekday-hex','Today. RRGGBB');");
+      C7_OAPPEND("c7i('colors','other-days-hex','Other days. RRGGBB');");
+      C7_OAPPEND("c7i('colors','weekend-hex','Sat + Sun. RRGGBB');");
+      C7_OAPPEND("c7i('buzzer-button','buzzer-pin','-1 = none');");
+      C7_OAPPEND("c7i('buzzer-button','button-pin','-1 = none');");
+      C7_OAPPEND("c7i('brightness','ldr-pin','ESP8266: ignore');");
+      C7_OAPPEND("c7i('rtc','battery-check','Off = no check');");
+      C7_OAPPEND("c7i('night','dim-percent','If Action = Dim');");
     }
 
     uint16_t getId() { return USERMOD_ID_UNSPECIFIED; }
