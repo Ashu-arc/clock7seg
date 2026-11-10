@@ -26,7 +26,9 @@ jobs:
       - name: Get WLED source (${{ matrix.wled_tag }})
         run: git clone --depth 1 --branch "${{ matrix.wled_tag }}" https://github.com/wled/WLED.git wled || git clone --depth 1 --branch "${{ matrix.wled_tag }}" https://github.com/Aircoookie/WLED.git wled
 
-      - name: Add clock usermod, welcome and info page name, AP name
+      - name: Add clock usermod, welcome page name, AP name, unique build number
+        env:
+          RUN_NUMBER: ${{ github.run_number }}
         run: |
           cp -r mine/usermods/ashish_clock_7seg wled/usermods/
           cp mine/platformio_override.ini wled/platformio_override.ini
@@ -43,6 +45,19 @@ jobs:
           s = s[:j] + "\n  #ifdef USERMOD_ASHISH_CLOCK7SEG\n  %s(new UsermodAshishClock7Seg());\n  #endif" % add + s[j:]
           open(p, "w", encoding="utf-8").write(s)
           print("usermod registered with", add)
+          # unique build number: WLED tags its web pages with VERSION, so browsers keep an OLD copy of
+          # the pages (welcome, info...) when the number never changes. +RUN_NUMBER makes every build new.
+          import os, re
+          p = "wled00/wled.h"
+          s = open(p, encoding="utf-8").read()
+          m = re.search(r"#define VERSION (\d+)", s)
+          if m:
+              newv = int(m.group(1)) + int(os.environ.get("RUN_NUMBER", "0"))
+              s = s[:m.start()] + "#define VERSION %d" % newv + s[m.end():]
+              open(p, "w", encoding="utf-8").write(s)
+              print("build number", m.group(1), "->", newv)
+          else:
+              print("WARNING: VERSION not found")
           try:
               import re
               p = "wled00/data/welcome.htm"
@@ -62,18 +77,6 @@ jobs:
               open(p, "w", encoding="utf-8").write(s)
           except Exception as e:
               print("WARNING welcome patch:", e)
-          try:
-              p = "wled00/data/index.js"
-              s = open(p, encoding="utf-8").read()
-              old = '"${vcn}"<br><br><table>'
-              new = '"${vcn}"<br><b style="font-size:22px;color:#ffb300">Ashish Automation</b><br><br><table>'
-              if old in s:
-                  open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
-                  print("info page name added")
-              else:
-                  print("WARNING: info page version line not found, skipped")
-          except Exception as e:
-              print("WARNING info patch:", e)
           PY
           # default WiFi access point name
           sed -i 's|^#define DEFAULT_AP_SSID .*|#define DEFAULT_AP_SSID     "CLOCK (Ashish Automation)"|' wled00/const.h
