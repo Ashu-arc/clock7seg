@@ -105,6 +105,8 @@ class UsermodAshishClock7Seg : public Usermod {
     bool    ldrInvert    = false;
     uint8_t briMin       = 20;
     uint8_t briMax       = 255;
+    // per-part brightness levels 0..255 (255 = full), multiplied with WLED's own brightness
+    uint8_t lvAll = 255, lvDigits = 255, lvColon = 255, lvToday = 255, lvOther = 255, lvAmPm = 255;
 
     bool    cdOn         = true;   // countdown timer enabled
     bool    swOn         = true;   // stopwatch enabled
@@ -543,6 +545,21 @@ class UsermodAshishClock7Seg : public Usermod {
       digitalWrite(heldBuz, (want != buzzerInvert) ? HIGH : LOW);
     }
 
+    // ---------- brightness levels ----------
+    uint8_t comb(uint8_t group) const { return (uint8_t)(((uint16_t)group * lvAll + 127) / 255); }   // group x all
+    // lit LED: optional own colour, then scale by level (255 = unchanged)
+    void putLit(uint16_t i, bool hasCol, uint32_t col, uint8_t level) {
+      if (!hasCol && level == 255) return;
+      uint32_t c = hasCol ? col : strip.getPixelColor(i);
+      strip.setPixelColor(i, level == 255 ? c : color_fade(c, level));
+    }
+    template<typename V> bool readLevel(const V& v, uint8_t& dst) {
+      uint16_t t = 255;
+      bool ok = getJsonValue(v, t, (uint16_t)255);
+      dst = t > 255 ? 255 : (uint8_t)t;
+      return ok;
+    }
+
     // ---------- display logic ----------
     bool inNight() const {
       if (!nightOn) return false;
@@ -766,6 +783,8 @@ class UsermodAshishClock7Seg : public Usermod {
       else if (st == 4) hasDigitCol = parseHex(timerHex, dcol);
       else if (st == 5) { dcol = 0xFF0000; hasDigitCol = true; }
 
+      uint8_t sDig = comb(lvDigits), sCol = comb(lvColon), sToday = comb(lvToday), sOther = comb(lvOther), sAp = comb(lvAmPm);
+
       // digits
       for (uint8_t d = 0; d < n; d++) {
         for (uint8_t s = 0; s < 7; s++) {
@@ -774,7 +793,7 @@ class UsermodAshishClock7Seg : public Usermod {
           for (uint8_t k = 0; k < ledsPerSeg; k++) {
             if (base + k >= total) break;
             if (!lit) strip.setPixelColor(base + k, 0);
-            else if (hasDigitCol) strip.setPixelColor(base + k, dcol);
+            else putLit(base + k, hasDigitCol, dcol, sDig);
           }
         }
       }
@@ -787,7 +806,7 @@ class UsermodAshishClock7Seg : public Usermod {
           uint16_t i = colonBaseAt(c) + k;
           if (i >= total) break;
           if (!colon) strip.setPixelColor(i, 0);
-          else if (hasColonCol) strip.setPixelColor(i, col);
+          else putLit(i, hasColonCol, col, sCol);
         }
       }
 
@@ -805,11 +824,11 @@ class UsermodAshishClock7Seg : public Usermod {
           if (weekdayMode == 0) strip.setPixelColor(i, 0);
           else if (weekdayMode == 1) {
             if (!isToday) strip.setPixelColor(i, 0);
-            else if (hasToday) strip.setPixelColor(i, todayCol);
+            else putLit(i, hasToday, todayCol, sToday);
           } else {
-            if (isToday) strip.setPixelColor(i, todayCol);        // red unless you set Weekday Hex
-            else if ((d == 0 || d == 6) && hasWeekend) strip.setPixelColor(i, weekendCol);   // Sun / Sat
-            else if (hasOther) strip.setPixelColor(i, otherCol);  // else main page colour
+            if (isToday) putLit(i, true, todayCol, sToday);                                  // red unless you set Weekday Hex
+            else if ((d == 0 || d == 6) && hasWeekend) putLit(i, true, weekendCol, sOther);  // Sun / Sat
+            else putLit(i, hasOther, otherCol, sOther);                                      // else main page colour
           }
         }
       }
@@ -824,8 +843,7 @@ class UsermodAshishClock7Seg : public Usermod {
             uint16_t i = ampmBase() + g * ampmLeds + k;
             if (i >= total) break;
             if (!lit) strip.setPixelColor(i, 0);
-            else if (g == 0 && hasAm) strip.setPixelColor(i, amCol);
-            else if (g == 1 && hasPm) strip.setPixelColor(i, pmCol);
+            else putLit(i, g == 0 ? hasAm : hasPm, g == 0 ? amCol : pmCol, sAp);
           }
         }
       }
@@ -1040,6 +1058,14 @@ class UsermodAshishClock7Seg : public Usermod {
       bz[F("buzzer-invert")] = buzzerInvert;
       bz[F("button-pin")] = buttonPin;
 
+      JsonObject lv = top.createNestedObject(F("levels"));
+      lv[F("all")] = lvAll;
+      lv[F("digits")] = lvDigits;
+      lv[F("colon")] = lvColon;
+      lv[F("today")] = lvToday;
+      lv[F("other-days")] = lvOther;
+      lv[F("am-pm")] = lvAmPm;
+
       JsonObject tm = top.createNestedObject(F("timer"));
       tm[F("countdown-on")] = cdOn;
       tm[F("countdown-min")] = cdMin;
@@ -1150,6 +1176,14 @@ class UsermodAshishClock7Seg : public Usermod {
       ok &= getJsonValue(bz[F("buzzer-invert")], buzzerInvert, false);
       ok &= getJsonValue(bz[F("button-pin")], buttonPin, (int8_t)-1);
 
+      JsonObject lv = top[F("levels")];
+      ok &= readLevel(lv[F("all")], lvAll);
+      ok &= readLevel(lv[F("digits")], lvDigits);
+      ok &= readLevel(lv[F("colon")], lvColon);
+      ok &= readLevel(lv[F("today")], lvToday);
+      ok &= readLevel(lv[F("other-days")], lvOther);
+      ok &= readLevel(lv[F("am-pm")], lvAmPm);
+
       JsonObject tm = top[F("timer")];
       ok &= getJsonValue(tm[F("countdown-on")], cdOn, true);
       ok &= getJsonValue(tm[F("countdown-min")], cdMin, (uint8_t)10);
@@ -1242,6 +1276,7 @@ class UsermodAshishClock7Seg : public Usermod {
       C7_OAPPEND("c7i('brightness','ldr-pin','ESP8266: ignore');");
       C7_OAPPEND("c7i('rtc','battery-check','Off = no check');");
       C7_OAPPEND("c7i('night','dim-percent','If Action = Dim');");
+      C7_OAPPEND("c7i('levels','all','0-255, 255 = full');");
     }
 
     uint16_t getId() { return USERMOD_ID_UNSPECIFIED; }
