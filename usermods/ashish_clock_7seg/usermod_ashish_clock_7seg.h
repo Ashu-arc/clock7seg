@@ -95,9 +95,12 @@ class UsermodAshishClock7Seg : public Usermod {
     int8_t  buttonPin    = -1;
 
     bool    nightOn      = false;
+    bool    nightHideSec = false;  // hide the seconds digits during the night window (6 digits)
+    bool    greetOn      = true;   // show ASHISH after power on
+    uint8_t greetSec     = 5;
     uint8_t nightStart   = 23;
     uint8_t nightEnd     = 6;
-    uint8_t nightAction  = 0;      // 0 display off, 1 dim
+    uint8_t nightAction  = 0;      // 0 display off, 1 dim, 2 keep on
     uint8_t nightDim     = 20;     // percent brightness when dimmed
 
     bool    autoBri      = false;
@@ -163,11 +166,12 @@ class UsermodAshishClock7Seg : public Usermod {
     unsigned long ringEnd = 0, chimeBeepStart = 0, beepUntil = 0, peekStart = 0;
     uint32_t snoozeAt = 0, alarmKey = 0, chimeKey = 0;
     bool     btnDown = false;
-    unsigned long bootTestUntil = 0;
+    unsigned long bootTestUntil = 0, greetFrom = 0, greetUntil = 0;
+    bool     secHiddenNow = false;
     unsigned long btnSince = 0, btnChange = 0;
 
-    // bit0=A ... bit6=G ; 0-9 digits, 10 blank, 11 dash, 12 degree, 13 C, 14 F, 15 b, 16 A, 17 t
-    static constexpr uint8_t PAT[18] = {0x3F,0x06,0x5B,0x4F,0x66,0x6D,0x7D,0x07,0x7F,0x6F,0x00,0x40,0x63,0x39,0x71,0x7C,0x77,0x78};
+    // bit0=A ... bit6=G ; 0-9 digits, 10 blank, 11 dash, 12 degree, 13 C, 14 F, 15 b, 16 A, 17 t, 18 H
+    static constexpr uint8_t PAT[19] = {0x3F,0x06,0x5B,0x4F,0x66,0x6D,0x7D,0x07,0x7F,0x6F,0x00,0x40,0x63,0x39,0x71,0x7C,0x77,0x78,0x76};
 
     static const char _name[];
 
@@ -561,6 +565,11 @@ class UsermodAshishClock7Seg : public Usermod {
     }
 
     // ---------- display logic ----------
+    bool greetActive() const {
+      unsigned long now = millis();
+      return greetUntil && (long)(now - greetFrom) >= 0 && (long)(greetUntil - now) > 0;
+    }
+
     bool inNight() const {
       if (!nightOn) return false;
       uint8_t h = hour(localTime);
@@ -608,7 +617,7 @@ class UsermodAshishClock7Seg : public Usermod {
     uint8_t buildFrame(uint8_t* patt, bool& colonOn, uint8_t& wdMask) {
       uint8_t n = digitCount();
       for (uint8_t i = 0; i < 6; i++) patt[i] = 0;
-      colonOn = false; wdMask = 0;
+      colonOn = false; wdMask = 0; secHiddenNow = false;
       time_t t = localTime;
       uint8_t wd = weekday(t);                                // 1 = Sunday
       if (wd >= 1 && wd <= 7) wdMask = 1 << (wd - 1);
@@ -627,6 +636,22 @@ class UsermodAshishClock7Seg : public Usermod {
       }
 
       uint8_t v[6] = {10,10,10,10,10,10};
+      if (!tm) {                                              // boot name ASHISH
+        bool g = greetActive();
+        if (!g && greetUntil && (long)(greetUntil - millis()) <= 0) greetUntil = 0;
+        if (g) {
+          static const uint8_t NAME[6] = {16, 5, 18, 1, 5, 18};      // A S H I S H
+          if (mode == 0) { for (uint8_t i = 0; i < 6; i++) v[i] = NAME[i]; }       // 6 digits: stays on
+          else {                                                       // 4 digits: ASHI > SHIS > HISH > ASHI
+            unsigned long el = millis() - greetFrom, frame = (el * 4UL) / ((unsigned long)greetSec * 1000UL);
+            uint8_t off = (frame >= 3) ? 0 : (uint8_t)frame;
+            for (uint8_t i = 0; i < 4; i++) v[i] = NAME[off + i];
+          }
+          for (uint8_t i = 0; i < n; i++) patt[i] = PAT[v[i]];
+          wdMask = 0; ampmMask = 0; colonOn = false;
+          return 6;
+        }
+      }
       if (timerMode) {                                        // countdown / stopwatch display
         uint32_t el = timerElapsedSec();
         uint32_t val = (timerMode == 1) ? (((uint32_t)cdMin * 60UL > el) ? (uint32_t)cdMin * 60UL - el : 0) : el;
@@ -646,6 +671,7 @@ class UsermodAshishClock7Seg : public Usermod {
         v[2] = m / 10; v[3] = m % 10;
         if (mode == 0) { v[4] = s / 10; v[5] = s % 10; }
         colonOn = !colonBlink || (toki.getTime().ms < 500);
+        if (nightHideSec && mode == 0 && inNight()) { v[4] = 10; v[5] = 10; secHiddenNow = true; }   // night: hide seconds
       } else if (st == 1) {
         int a = dateOrder == 0 ? day(t) : month(t);
         int b = dateOrder == 0 ? month(t) : day(t);
@@ -692,6 +718,7 @@ class UsermodAshishClock7Seg : public Usermod {
       setupDone = true;
       buildOrder();
       if (startupTest) bootTestUntil = millis() + 3000;
+      if (greetOn) { greetFrom = millis() + (startupTest ? 3000UL : 0UL); greetUntil = greetFrom + (unsigned long)greetSec * 1000UL; }
       if (configRead) initHw();
     }
 
@@ -759,7 +786,7 @@ class UsermodAshishClock7Seg : public Usermod {
       if (blankExtra) { for (uint16_t i = endLed; i < total; i++) strip.setPixelColor(i, 0); }   // LEDs after the clock chain stay off
       if (endLed > total) endLed = total;
 
-      bool night = inNight() && !testMode && timerMode == 0;
+      bool night = inNight() && !testMode && timerMode == 0 && !greetActive();
       bool ringBlank = (ringing || timerDone) && ((millis() / 500) % 2) == 1;
       if (ringBlank || (night && nightAction == 0)) {
         for (uint16_t i = firstLed; i < endLed; i++) strip.setPixelColor(i, 0);
@@ -805,7 +832,7 @@ class UsermodAshishClock7Seg : public Usermod {
         for (uint8_t k = 0; k < colonLeds; k++) {
           uint16_t i = colonBaseAt(c) + k;
           if (i >= total) break;
-          if (!colon) strip.setPixelColor(i, 0);
+          if (!colon || (c == 1 && secHiddenNow)) strip.setPixelColor(i, 0);
           else putLit(i, hasColonCol, col, sCol);
         }
       }
@@ -821,7 +848,7 @@ class UsermodAshishClock7Seg : public Usermod {
         for (uint8_t k = 0; k < ledsPerDay; k++) {
           uint16_t i = dayBase() + d * ledsPerDay + k;
           if (i >= total) break;
-          if (weekdayMode == 0) strip.setPixelColor(i, 0);
+          if (weekdayMode == 0 || st == 6) strip.setPixelColor(i, 0);
           else if (weekdayMode == 1) {
             if (!isToday) strip.setPixelColor(i, 0);
             else putLit(i, hasToday, todayCol, sToday);
@@ -859,6 +886,9 @@ class UsermodAshishClock7Seg : public Usermod {
     void addToJsonInfo(JsonObject& root) {
       JsonObject user = root[F("u")];
       if (user.isNull()) user = root.createNestedObject(F("u"));
+
+      JsonArray a00 = user.createNestedArray(F("<b style='font-size:20px;color:#ffb300'>Ashish Automation</b>"));
+      a00.add(F("clock"));
 
       static const char* const WD[7]  = {"Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"};
       static const char* const MON[12] = {"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"};
@@ -1058,6 +1088,10 @@ class UsermodAshishClock7Seg : public Usermod {
       bz[F("buzzer-invert")] = buzzerInvert;
       bz[F("button-pin")] = buttonPin;
 
+      JsonObject bn = top.createNestedObject(F("boot-name"));
+      bn[F("enabled")] = greetOn;
+      bn[F("seconds")] = greetSec;
+
       JsonObject lv = top.createNestedObject(F("levels"));
       lv[F("all")] = lvAll;
       lv[F("digits")] = lvDigits;
@@ -1078,6 +1112,7 @@ class UsermodAshishClock7Seg : public Usermod {
       n[F("end-hour")] = nightEnd;
       n[F("action")] = nightAction;
       n[F("dim-percent")] = nightDim;
+      n[F("hide-seconds")] = nightHideSec;
 
       JsonObject b = top.createNestedObject(F("brightness"));
       b[F("auto")] = autoBri;
@@ -1176,6 +1211,10 @@ class UsermodAshishClock7Seg : public Usermod {
       ok &= getJsonValue(bz[F("buzzer-invert")], buzzerInvert, false);
       ok &= getJsonValue(bz[F("button-pin")], buttonPin, (int8_t)-1);
 
+      JsonObject bn = top[F("boot-name")];
+      ok &= getJsonValue(bn[F("enabled")], greetOn, true);
+      ok &= getJsonValue(bn[F("seconds")], greetSec, (uint8_t)5);
+
       JsonObject lv = top[F("levels")];
       ok &= readLevel(lv[F("all")], lvAll);
       ok &= readLevel(lv[F("digits")], lvDigits);
@@ -1196,6 +1235,7 @@ class UsermodAshishClock7Seg : public Usermod {
       ok &= getJsonValue(n[F("end-hour")], nightEnd, (uint8_t)6);
       ok &= getJsonValue(n[F("action")], nightAction, (uint8_t)0);
       ok &= getJsonValue(n[F("dim-percent")], nightDim, (uint8_t)20);
+      ok &= getJsonValue(n[F("hide-seconds")], nightHideSec, false);
 
       JsonObject b = top[F("brightness")];
       ok &= getJsonValue(b[F("auto")], autoBri, false);
@@ -1226,7 +1266,7 @@ class UsermodAshishClock7Seg : public Usermod {
       weekdayMode = weekdayMode > 2 ? 1 : weekdayMode;
       cdMin = constrain(cdMin, 1, 99); timerRingSec = constrain(timerRingSec, 3, 60);
       ampmLeds = constrain(ampmLeds, 1, 6); tempSource = tempSource ? 1 : 0; rereadMin = constrain(rereadMin, 1, 60);
-      nightAction = nightAction ? 1 : 0; nightDim = constrain(nightDim, 1, 100);
+      nightAction = nightAction > 2 ? 0 : nightAction; greetSec = constrain(greetSec, 1, 15); nightDim = constrain(nightDim, 1, 100);
       ledsPerDay = constrain(ledsPerDay, 1, 5);
       segPreset  = segPreset > 3 ? 1 : segPreset;
       dateOrder  = dateOrder ? 1 : 0;
@@ -1261,7 +1301,7 @@ class UsermodAshishClock7Seg : public Usermod {
       C7_OAPPEND("c7d('temperature','unit',['C','F']);");
       C7_OAPPEND("c7d('date','order',['Day-Month','Month-Day']);");
       C7_OAPPEND("c7d('alarm','days',['Every day','Mon-Fri','Sat-Sun']);");
-      C7_OAPPEND("c7d('night','action',['Off','Dim']);");
+      C7_OAPPEND("c7d('night','action',['Off','Dim','Keep on']);");
       C7_OAPPEND("c7d('rtc','chip',['DS1307','DS3231']);");
       C7_OAPPEND("c7d('test','mode',['Off','All ON','Seg walk','Digit count']);");
       C7_OAPPEND("c7i('wiring','seg-order','Used if preset = Custom');");
@@ -1277,10 +1317,11 @@ class UsermodAshishClock7Seg : public Usermod {
       C7_OAPPEND("c7i('rtc','battery-check','Off = no check');");
       C7_OAPPEND("c7i('night','dim-percent','If Action = Dim');");
       C7_OAPPEND("c7i('levels','all','0-255, 255 = full');");
+      C7_OAPPEND("c7i('night','hide-seconds','6 digits only');");
     }
 
     uint16_t getId() { return USERMOD_ID_UNSPECIFIED; }
 };
 
 const char UsermodAshishClock7Seg::_name[] PROGMEM = "Ashish Automation";
-constexpr uint8_t UsermodAshishClock7Seg::PAT[18];
+constexpr uint8_t UsermodAshishClock7Seg::PAT[19];
