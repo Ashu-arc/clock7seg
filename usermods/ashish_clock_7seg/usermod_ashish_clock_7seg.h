@@ -642,10 +642,10 @@ class UsermodAshishClock7Seg : public Usermod {
         if (g) {
           static const uint8_t NAME[6] = {16, 5, 18, 1, 5, 18};      // A S H I S H
           if (mode == 0) { for (uint8_t i = 0; i < 6; i++) v[i] = NAME[i]; }       // 6 digits: stays on
-          else {                                                       // 4 digits: ASHI > SHIS > HISH > ASHI
-            unsigned long el = millis() - greetFrom, frame = (el * 4UL) / ((unsigned long)greetSec * 1000UL);
-            uint8_t off = (frame >= 3) ? 0 : (uint8_t)frame;
-            for (uint8_t i = 0; i < 4; i++) v[i] = NAME[off + i];
+          else {                                                       // 4 digits: [A S H I] 1.25 s, then [_ S H _] 1.25 s, repeat
+            unsigned long frame = (millis() - greetFrom) / 1250UL;
+            if ((frame & 1) == 0) { for (uint8_t i = 0; i < 4; i++) v[i] = NAME[i]; }   // A S H I
+            else { v[1] = NAME[1]; v[2] = NAME[2]; }                                     // S H on the middle two digits
           }
           for (uint8_t i = 0; i < n; i++) patt[i] = PAT[v[i]];
           wdMask = 0; ampmMask = 0; colonOn = false;
@@ -886,9 +886,6 @@ class UsermodAshishClock7Seg : public Usermod {
     void addToJsonInfo(JsonObject& root) {
       JsonObject user = root[F("u")];
       if (user.isNull()) user = root.createNestedObject(F("u"));
-
-      JsonArray a00 = user.createNestedArray(F("<b style='font-size:20px;color:#ffb300'>Ashish Automation</b>"));
-      a00.add(F("clock"));
 
       static const char* const WD[7]  = {"Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"};
       static const char* const MON[12] = {"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"};
