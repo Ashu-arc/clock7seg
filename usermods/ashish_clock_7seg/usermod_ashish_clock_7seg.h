@@ -109,6 +109,7 @@ class UsermodAshishClock7Seg : public Usermod {
     uint8_t briMin       = 20;
     uint8_t briMax       = 255;
     // per-part brightness levels 0..255 (255 = full), multiplied with WLED's own brightness
+    uint8_t colorSource  = 0;      // 0 from effect, 1 main colour, 2 effect but never black
     uint8_t lvAll = 255, lvDigits = 255, lvColon = 255, lvToday = 255, lvOther = 255, lvAmPm = 255;
 
     bool    cdOn         = true;   // countdown timer enabled
@@ -151,6 +152,7 @@ class UsermodAshishClock7Seg : public Usermod {
     uint16_t rereadCount = 0;
     unsigned long lastReread = 0, lastRereadAt = 0;
     uint8_t  ampmMask    = 0;
+    uint32_t mainCol     = 0xFFFFFF;
     uint8_t  timerMode = 0;        // 0 clock, 1 countdown, 2 stopwatch
     bool     timerRunning = false, timerDone = false, pendingShort = false;
     unsigned long timerStartMs = 0, timerAccumMs = 0, timerRingEnd = 0, lastBtnAct = 0, pendingAt = 0, lastBattCheck = 0;
@@ -551,10 +553,19 @@ class UsermodAshishClock7Seg : public Usermod {
 
     // ---------- brightness levels ----------
     uint8_t comb(uint8_t group) const { return (uint8_t)(((uint16_t)group * lvAll + 127) / 255); }   // group x all
-    // lit LED: optional own colour, then scale by level (255 = unchanged)
+    // lit LED: own colour (hex) or the colour source, then scale by level (255 = unchanged)
     void putLit(uint16_t i, bool hasCol, uint32_t col, uint8_t level) {
-      if (!hasCol && level == 255) return;
-      uint32_t c = hasCol ? col : strip.getPixelColor(i);
+      if (!hasCol && level == 255 && colorSource == 0) return;
+      uint32_t c;
+      if (hasCol) c = col;
+      else {
+        c = strip.getPixelColor(i);
+        if (colorSource == 1) c = mainCol;                                           // always the main page colour
+        else if (colorSource == 2) {                                                 // effect colour, but never black
+          uint16_t sum = ((c >> 24) & 255) + ((c >> 16) & 255) + ((c >> 8) & 255) + (c & 255);
+          if (sum < 24) c = mainCol;
+        }
+      }
       strip.setPixelColor(i, level == 255 ? c : color_fade(c, level));
     }
     template<typename V> bool readLevel(const V& v, uint8_t& dst) {
@@ -810,6 +821,7 @@ class UsermodAshishClock7Seg : public Usermod {
       else if (st == 4) hasDigitCol = parseHex(timerHex, dcol);
       else if (st == 5) { dcol = 0xFF0000; hasDigitCol = true; }
 
+      if (colorSource) { mainCol = strip.getMainSegment().colors[0]; if (mainCol == 0) mainCol = 0xFFFFFF; }   // main page colour (white if black)
       uint8_t sDig = comb(lvDigits), sCol = comb(lvColon), sToday = comb(lvToday), sOther = comb(lvOther), sAp = comb(lvAmPm);
 
       // digits
@@ -1059,6 +1071,7 @@ class UsermodAshishClock7Seg : public Usermod {
       tp[F("offset")] = tempOffset;
 
       JsonObject c = top.createNestedObject(F("colors"));
+      c[F("color-source")] = colorSource;
       c[F("weekday-hex")] = wdHex;
       c[F("other-days-hex")] = otherHex;
       c[F("weekend-hex")] = weekendHex;
@@ -1181,6 +1194,7 @@ class UsermodAshishClock7Seg : public Usermod {
       ok &= getJsonValue(tp[F("offset")], tempOffset, (int8_t)0);
 
       JsonObject c = top[F("colors")];
+      ok &= getJsonValue(c[F("color-source")], colorSource, (uint8_t)0);
       copyStr(wdHex, sizeof(wdHex), c[F("weekday-hex")] | "");
       copyStr(otherHex, sizeof(otherHex), c[F("other-days-hex")] | "");
       copyStr(weekendHex, sizeof(weekendHex), c[F("weekend-hex")] | "");
@@ -1261,6 +1275,7 @@ class UsermodAshishClock7Seg : public Usermod {
       ledsPerSeg = constrain(ledsPerSeg, 1, 10);
       colonLeds  = constrain(colonLeds, 1, 6);
       weekdayMode = weekdayMode > 2 ? 1 : weekdayMode;
+      colorSource = colorSource > 2 ? 0 : colorSource;
       cdMin = constrain(cdMin, 1, 99); timerRingSec = constrain(timerRingSec, 3, 60);
       ampmLeds = constrain(ampmLeds, 1, 6); tempSource = tempSource ? 1 : 0; rereadMin = constrain(rereadMin, 1, 60);
       nightAction = nightAction > 2 ? 0 : nightAction; greetSec = constrain(greetSec, 1, 15); nightDim = constrain(nightDim, 1, 100);
@@ -1292,6 +1307,7 @@ class UsermodAshishClock7Seg : public Usermod {
       C7_OAPPEND("try{var h=document.getElementsByTagName('h2')[0],t=document.getElementsByTagName('h3');for(var i=0;i<t.length;i++)if(t[i].textContent.trim()=='Ashish Automation')t[i].style.fontSize=getComputedStyle(h).fontSize}catch(e){}");
       C7_OAPPEND("c7d('display','mode',['6 digits HH:MM:SS','4 digits HH:MM']);");
       C7_OAPPEND("c7d('display','weekday-mode',['Off','Today only','All on, today differs']);");
+      C7_OAPPEND("c7d('colors','color-source',['From effect','Main colour','Effect, no black']);");
       C7_OAPPEND("c7d('display','hour-format',['24 hour','12 hour']);");
       C7_OAPPEND("c7d('wiring','seg-preset',['Custom','F-A-B-G-E-D-C (default)','A-B-C-D-E-F-G','F-A-B-C-D-E-G']);");
       C7_OAPPEND("c7d('temperature','source',['DS3231','BMP280']);");
