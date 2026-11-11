@@ -26,7 +26,7 @@ jobs:
       - name: Get WLED source (${{ matrix.wled_tag }})
         run: git clone --depth 1 --branch "${{ matrix.wled_tag }}" https://github.com/wled/WLED.git wled || git clone --depth 1 --branch "${{ matrix.wled_tag }}" https://github.com/Aircoookie/WLED.git wled
 
-      - name: Add clock usermod, welcome page name, AP name, unique build number
+      - name: Add clock usermod, welcome and info page name, AP name, unique build number
         env:
           RUN_NUMBER: ${{ github.run_number }}
         run: |
@@ -77,6 +77,24 @@ jobs:
               open(p, "w", encoding="utf-8").write(s)
           except Exception as e:
               print("WARNING welcome patch:", e)
+          try:
+              p = "wled00/data/index.js"
+              s = open(p, encoding="utf-8").read()
+              tag = '<br><b style="font-size:22px;color:#ffb300">Ashish Automation</b>'
+              old = '"${vcn}"<br><br><table>'
+              if old in s:
+                  s = s.replace(old, '"${vcn}"' + tag + '<br><br><table>', 1)
+                  print("info page name added")
+              else:
+                  m = re.search(r"(\$\{i\.ver\}[^\n]*?)<br><br><table>", s)
+                  if m:
+                      s = s[:m.end(1)] + tag + s[m.end(1):]
+                      print("info page name added (regex)")
+                  else:
+                      print("WARNING: info page version line not found")
+              open(p, "w", encoding="utf-8").write(s)
+          except Exception as e:
+              print("WARNING info patch:", e)
           PY
           # default WiFi access point name
           sed -i 's|^#define DEFAULT_AP_SSID .*|#define DEFAULT_AP_SSID     "CLOCK (Ashish Automation)"|' wled00/const.h
@@ -91,7 +109,14 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install tools
-        run: pip install platformio esptool && cd wled && npm ci
+        run: |
+          pip install platformio esptool
+          cd wled
+          npm ci
+          # WLED 0.14.4 ships ready-made page files and does not rebuild them: do it here so the
+          # welcome / info page changes are really inside the firmware (0.15.0 rebuilds by itself)
+          rm -f wled00/html_*.h
+          npm run build
 
       - name: Build ESP8266 (4MB) and ESP32
         run: |
