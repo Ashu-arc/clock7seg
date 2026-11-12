@@ -126,7 +126,7 @@ class UsermodAshishClock7Seg : public Usermod {
     int8_t  rtcScl       = C7_DEF_SCL;
     uint8_t rtcSyncHours = 6;
     bool    rereadOn     = true;   // re-read RTC when there is no internet time
-    uint8_t rereadMin    = 5;      // minutes between re-reads
+    uint8_t rereadMin    = 2;      // minutes between re-reads
 
     uint8_t testMode     = 0;      // 0 off, 1 all on, 2 segment walk, 3 digit count
 
@@ -148,7 +148,11 @@ class UsermodAshishClock7Seg : public Usermod {
     uint16_t dT1 = 0, dP1 = 0;
     int16_t  dT2 = 0, dT3 = 0, dP2 = 0, dP3 = 0, dP4 = 0, dP5 = 0, dP6 = 0, dP7 = 0, dP8 = 0, dP9 = 0;
     bool     offline     = true;
-    int32_t  rtcDiff     = 0;
+    int32_t  rtcDiffMs   = 0;      // last measured clock - RTC difference (ms, + = clock was ahead)
+    uint16_t rtcBadReads = 0;      // RTC reads thrown away (noisy I2C)
+    uint8_t  syncState   = 0;      // 0 idle, 1 waiting for the RTC second to change
+    time_t   syncBase    = 0;
+    unsigned long syncStart = 0, syncPollAt = 0, lastRtcWriteTry = 0;
     uint16_t rereadCount = 0;
     unsigned long lastReread = 0, lastRereadAt = 0;
     uint8_t  ampmMask    = 0;
@@ -228,14 +232,19 @@ class UsermodAshishClock7Seg : public Usermod {
       return Wire.endTransmission() == 0;
     }
 
-    bool rtcRead(time_t &out) {
+    // One raw read of the RTC.  0 = ok, 1 = time invalid (halted / never set / bad digits), 2 = bus error
+    uint8_t rtcReadOnce(time_t &out) {
       Wire.beginTransmission(C7_RTC_ADDR);
       Wire.write((uint8_t)0);
-      if (Wire.endTransmission() != 0) return false;
-      if (Wire.requestFrom((uint8_t)C7_RTC_ADDR, (uint8_t)7) != 7) return false;
+      if (Wire.endTransmission() != 0) return 2;
+      if (Wire.requestFrom((uint8_t)C7_RTC_ADDR, (uint8_t)7) != 7) return 2;
       uint8_t b[7];
       for (int i = 0; i < 7; i++) b[i] = Wire.read();
-      if (b[0] & 0x80) { rtcInvalid = true; return false; }   // DS1307 clock halted
+      if (b[0] & 0x80) return 1;                              // DS1307 clock halted
+      for (int i = 0; i < 7; i++) {                           // every BCD digit must be 0-9 (a noisy bus gives garbage)
+        if (i == 3) continue;                                 // weekday register
+        if ((b[i] & 0x0F) > 9 || ((b[i] >> 4) & 0x0F) > 9) return 1;
+      }
       tmElements_t tm;
       tm.Second = bcd2dec(b[0] & 0x7F);
       tm.Minute = bcd2dec(b[1] & 0x7F);
@@ -246,11 +255,27 @@ class UsermodAshishClock7Seg : public Usermod {
       tm.Day   = bcd2dec(b[4] & 0x3F);
       tm.Month = bcd2dec(b[5] & 0x1F);
       tm.Year  = bcd2dec(b[6]) + 30;
-      if (tm.Second > 59 || tm.Minute > 59 || tm.Hour > 23 || tm.Day < 1 || tm.Day > 31 || tm.Month < 1 || tm.Month > 12) { rtcInvalid = true; return false; }
-      if (tm.Year < 50) { rtcInvalid = true; return false; }  // before 2020 = never set / battery was empty
-      rtcInvalid = false;
+      if (tm.Second > 59 || tm.Minute > 59 || tm.Hour > 23 || tm.Day < 1 || tm.Day > 31 || tm.Month < 1 || tm.Month > 12) return 1;
+      if (tm.Year < 50) return 1;                             // before 2020 = never set / battery was empty
       out = makeTime(tm);
-      return true;
+      return 0;
+    }
+
+    // Stable read: two reads in a row must agree (within 1 s) before the value is trusted.
+    // A single flipped bit on the I2C wires (e.g. 08 read as 18) can no longer move the clock by 10 seconds.
+    bool rtcRead(time_t &out) {
+      for (uint8_t attempt = 0; attempt < 3; attempt++) {
+        time_t a = 0, b = 0;
+        uint8_t ra = rtcReadOnce(a);
+        delay(2);
+        uint8_t rb = rtcReadOnce(b);
+        if (ra == 0 && rb == 0) {
+          int32_t d = (int32_t)((uint32_t)b - (uint32_t)a);
+          if (d >= 0 && d <= 1) { out = b; rtcInvalid = false; return true; }
+        } else if (ra == 1 && rb == 1) { rtcInvalid = true; return false; }   // really invalid (twice)
+        if (rtcBadReads < 65535) rtcBadReads++;               // the two reads disagreed: noise, try again
+      }
+      return false;
     }
 
     bool rtcWrite(time_t t) {
@@ -271,8 +296,8 @@ class UsermodAshishClock7Seg : public Usermod {
 
     // DS3231 status register 0x0F bit 7 = oscillator stopped (battery was empty / power lost)
     void rtcReadOsf() {
-      uint8_t st = 0;
-      if (i2cReadRegs(C7_RTC_ADDR, 0x0F, &st, 1)) rtcOsf = (st & 0x80) != 0;
+      uint8_t st1 = 0, st2 = 0;
+      if (i2cReadRegs(C7_RTC_ADDR, 0x0F, &st1, 1) && i2cReadRegs(C7_RTC_ADDR, 0x0F, &st2, 1)) rtcOsf = ((st1 & st2) & 0x80) != 0;
     }
     void rtcClearOsf() { if (i2cWriteReg(C7_RTC_ADDR, 0x0F, 0x00)) rtcOsf = false; }
     void updateRtcWarn() { rtcWarn = battCheck && rtcEnabled && rtcReady && (rtcInvalid || (rtcChip == 1 && rtcOsf)); }
@@ -404,6 +429,7 @@ class UsermodAshishClock7Seg : public Usermod {
           if (tempSource == 1) bmpReady = bmpInit();
         }
       }
+      lastReread = millis() - (unsigned long)rereadMin * 60000UL + 3000UL;      // first RTC alignment 3 s after start (if offline)
       #ifndef ESP8266
       if (autoBri && ldrPin >= 0) {
         if (C7_PM allocatePin(ldrPin, false, PinOwner::UM_Unspecified)) heldLdr = ldrPin;
@@ -733,10 +759,28 @@ class UsermodAshishClock7Seg : public Usermod {
       if (configRead) initHw();
     }
 
+    // Waits (non-blocking) for the RTC second to change, then aligns the clock to that exact moment
+    void pollEdge(unsigned long now) {
+      if (now - syncPollAt < 20) return;
+      syncPollAt = now;
+      if (now - syncStart > 1600) { syncState = 0; return; }   // RTC second never changed: give up
+      time_t t1, t2;
+      if (rtcReadOnce(t1) != 0) return;
+      if (t1 != syncBase + 1) return;                          // not the next second yet (or noise)
+      if (rtcReadOnce(t2) != 0 || t2 != t1) return;            // confirm with a second read
+      // the RTC second changed within the last ~20 ms
+      int32_t sysMs = (int32_t)toki.getTime().ms;
+      int32_t offMs = (int32_t)((uint32_t)toki.second() - (uint32_t)t1) * 1000 + sysMs - 10;   // + = clock ahead of the RTC
+      rtcDiffMs = offMs; lastRereadAt = now; if (rereadCount < 65535) rereadCount++;
+      if (offMs >= 150 || offMs <= -150) { toki.setTime(t1, 10, TOKI_TS_RTC); updateLocalTime(); }
+      syncState = 0;
+    }
+
     void loop() {
       unsigned long now = millis();
       pollButton(now);
       updateBuzzer(now);
+      if (syncState) pollEdge(now);
       if (now - lastTick < 100) return;
       lastTick = now;
 
@@ -757,23 +801,26 @@ class UsermodAshishClock7Seg : public Usermod {
         if (online) { if (offline) { offline = false; rtcWritten = false; } }   // internet is back: update RTC soon
         else offline = true;
 
-        // no internet time: correct the clock from the RTC every N minutes (only if 2 s or more off)
-        if (rereadOn && !online && now - lastReread >= (unsigned long)rereadMin * 60000UL) {
+        // no internet time: every N minutes read the RTC, then wait for its next second edge and
+        // align the clock to it (accuracy about 0.02 s). Only moved when 0.15 s or more off.
+        if (rereadOn && !online && syncState == 0 && now - lastReread >= (unsigned long)rereadMin * 60000UL) {
           lastReread = now;
           time_t rt;
-          if (rtcRead(rt)) {
-            rtcDiff = (int32_t)((uint32_t)toki.second() - (uint32_t)rt);
-            lastRereadAt = now; if (rereadCount < 65535) rereadCount++;
-            if (rtcDiff >= 2 || rtcDiff <= -2) { toki.setTime(rt, TOKI_NO_MS_ACCURACY, TOKI_TS_RTC); updateLocalTime(); }
-          }
+          if (rtcRead(rt)) { syncBase = rt; syncState = 1; syncStart = now; syncPollAt = 0; }
         }
 
         uint8_t src = toki.getTimeSource();
-        if (src > TOKI_TS_RTC) {                              // time came from NTP / browser
+        if (src > TOKI_TS_RTC && (lastRtcWriteTry == 0 || now - lastRtcWriteTry > 30000UL)) {   // time came from NTP / browser
           bool due = !rtcWritten || (rtcSyncHours > 0 && now - lastRtcWrite > (unsigned long)rtcSyncHours * 3600000UL);
           if (due && toki.isTick()) {
-            if (rtcWrite(toki.second())) { rtcWritten = true; lastRtcWrite = now; }
-            else lastRtcWrite = now - (unsigned long)rtcSyncHours * 3600000UL + 60000UL;
+            lastRtcWriteTry = now ? now : 1;
+            bool ok = false;
+            if (rtcWrite(toki.second())) {                    // write, then read back to be sure it is right
+              time_t chk;
+              delay(3);
+              if (rtcRead(chk)) { int32_t d = (int32_t)((uint32_t)chk - (uint32_t)toki.second()); ok = (d >= -2 && d <= 2); }
+            }
+            if (ok) { rtcWritten = true; lastRtcWrite = now; } else rtcWritten = false;           // retry in 30 s
           }
         }
       }
@@ -944,7 +991,7 @@ class UsermodAshishClock7Seg : public Usermod {
       else if (!rereadOn) a5b.add(F("off"));
       else if (internetOk()) a5b.add(F("not needed (internet time OK)"));
       else if (rereadCount == 0) { snprintf(b, sizeof(b), "every %d min, waiting", rereadMin); a5b.add(String(b)); }
-      else { snprintf(b, sizeof(b), "every %d min, last diff %ld s", rereadMin, (long)rtcDiff); a5b.add(String(b)); }
+      else { char bb[72]; snprintf(bb, sizeof(bb), "every %d min, last diff %ld ms, bad reads %d", rereadMin, (long)rtcDiffMs, (int)rtcBadReads); a5b.add(String(bb)); }
 
       // 5c) RTC battery / time warning
       JsonArray a5c = user.createNestedArray(F("Clock RTC battery"));
@@ -1262,7 +1309,7 @@ class UsermodAshishClock7Seg : public Usermod {
       ok &= getJsonValue(r[F("scl-pin")], rtcScl, (int8_t)C7_DEF_SCL);
       ok &= getJsonValue(r[F("sync-hours")], rtcSyncHours, (uint8_t)6);
       ok &= getJsonValue(r[F("reread-on")], rereadOn, true);
-      ok &= getJsonValue(r[F("reread-min")], rereadMin, (uint8_t)5);
+      ok &= getJsonValue(r[F("reread-min")], rereadMin, (uint8_t)2);
       ok &= getJsonValue(r[F("battery-check")], battCheck, true);
       ok &= getJsonValue(r[F("warn-display")], warnShow, true);
 
