@@ -45,6 +45,7 @@ class UsermodAshishClock7Seg : public Usermod {
     bool    leadingZero  = true;
     bool    colonBlink   = true;
     uint8_t weekdayMode  = 1;      // 0 off, 1 today only, 2 all on (today highlighted)
+    uint8_t weekdayOrder = 0;      // LED order of the days: 0 Sun>Sat, 1 Sat>Sun (flipped), 2 Mon>Sun, 3 Sun>Mon (flipped)
     bool    startupTest  = false;  // lamp test for 3 s after power on
 
     uint16_t firstLed    = 0;
@@ -577,6 +578,21 @@ class UsermodAshishClock7Seg : public Usermod {
       digitalWrite(heldBuz, (want != buzzerInvert) ? HIGH : LOW);
     }
 
+    // ---------- weekday LED order ----------
+    // day: 0 = Sunday ... 6 = Saturday.  Returns the LED position (0..6) of that day in the chain.
+    uint8_t weekdayPos(uint8_t day) const {
+      switch (weekdayOrder) {
+        case 1:  return 6 - day;                  // Saturday first ... Sunday last (flipped)
+        case 2:  return (day + 6) % 7;            // Monday first ... Sunday last
+        case 3:  return 6 - ((day + 6) % 7);      // Sunday first ... Monday last (flipped)
+        default: return day;                      // Sunday first ... Saturday last
+      }
+    }
+    uint8_t weekdayAtPos(uint8_t pos) const {     // which day sits at LED position pos
+      for (uint8_t d = 0; d < 7; d++) if (weekdayPos(d) == pos) return d;
+      return 0;
+    }
+
     // ---------- brightness levels ----------
     uint8_t comb(uint8_t group) const { return (uint8_t)(((uint16_t)group * lvAll + 127) / 255); }   // group x all
     // lit LED: own colour (hex) or the colour source, then scale by level (255 = unchanged)
@@ -667,7 +683,7 @@ class UsermodAshishClock7Seg : public Usermod {
         uint8_t step = (millis() / 800) % 7;
         ampmMask = (tm == 2) ? ((step & 1) ? 2 : 1) : 3;
         if (tm == 1) { for (uint8_t i = 0; i < n; i++) patt[i] = 0x7F; colonOn = true; wdMask = 0x7F; }
-        else if (tm == 2) { for (uint8_t i = 0; i < n; i++) patt[i] = 1 << step; wdMask = 1 << step; }
+        else if (tm == 2) { for (uint8_t i = 0; i < n; i++) patt[i] = 1 << step; wdMask = 1 << weekdayAtPos(step); }   // weekday LEDs walk along the chain
         else { uint8_t d = (millis() / 1000) % 10; for (uint8_t i = 0; i < n; i++) patt[i] = PAT[d]; colonOn = true; }
         return 0;
       }
@@ -905,7 +921,7 @@ class UsermodAshishClock7Seg : public Usermod {
       for (uint8_t d = 0; d < 7; d++) {
         bool isToday = (wdm >> d) & 1;
         for (uint8_t k = 0; k < ledsPerDay; k++) {
-          uint16_t i = dayBase() + d * ledsPerDay + k;
+          uint16_t i = dayBase() + weekdayPos(d) * ledsPerDay + k;
           if (i >= total) break;
           if (weekdayMode == 0 || st == 6) strip.setPixelColor(i, 0);
           else if (weekdayMode == 1) {
@@ -969,7 +985,7 @@ class UsermodAshishClock7Seg : public Usermod {
       uint8_t wd = weekday(t); if (wd < 1 || wd > 7) wd = 1;
       JsonArray a3 = user.createNestedArray(F("Clock weekday"));
       a3.add(WD[wd - 1]);
-      snprintf(b, sizeof(b), " (LED %d of 7)", wd);
+      snprintf(b, sizeof(b), " (LED %d of 7)", (int)weekdayPos(wd - 1) + 1);
       a3.add(String(b));
 
       // 4) LDR / brightness
@@ -1100,6 +1116,7 @@ class UsermodAshishClock7Seg : public Usermod {
       d[F("leading-zero")] = leadingZero;
       d[F("colon-blink")] = colonBlink;
       d[F("weekday-mode")] = weekdayMode;
+      d[F("weekday-order")] = weekdayOrder;
       d[F("startup-test")] = startupTest;
 
       JsonObject dt = top.createNestedObject(F("date"));
@@ -1223,6 +1240,7 @@ class UsermodAshishClock7Seg : public Usermod {
       ok &= getJsonValue(d[F("leading-zero")], leadingZero, true);
       ok &= getJsonValue(d[F("colon-blink")], colonBlink, true);
       ok &= getJsonValue(d[F("weekday-mode")], weekdayMode, (uint8_t)1);
+      ok &= getJsonValue(d[F("weekday-order")], weekdayOrder, (uint8_t)0);
       ok &= getJsonValue(d[F("startup-test")], startupTest, false);
 
       JsonObject dt = top[F("date")];
@@ -1322,6 +1340,7 @@ class UsermodAshishClock7Seg : public Usermod {
       ledsPerSeg = constrain(ledsPerSeg, 1, 10);
       colonLeds  = constrain(colonLeds, 1, 6);
       weekdayMode = weekdayMode > 2 ? 1 : weekdayMode;
+      weekdayOrder = weekdayOrder > 3 ? 0 : weekdayOrder;
       colorSource = colorSource > 2 ? 0 : colorSource;
       cdMin = constrain(cdMin, 1, 99); timerRingSec = constrain(timerRingSec, 3, 60);
       ampmLeds = constrain(ampmLeds, 1, 6); tempSource = tempSource ? 1 : 0; rereadMin = constrain(rereadMin, 1, 60);
@@ -1354,6 +1373,7 @@ class UsermodAshishClock7Seg : public Usermod {
       C7_OAPPEND("try{var h=document.getElementsByTagName('h2')[0],t=document.getElementsByTagName('h3');for(var i=0;i<t.length;i++)if(t[i].textContent.trim()=='Ashish Automation')t[i].style.fontSize=getComputedStyle(h).fontSize}catch(e){}");
       C7_OAPPEND("c7d('display','mode',['6 digits HH:MM:SS','4 digits HH:MM']);");
       C7_OAPPEND("c7d('display','weekday-mode',['Off','Today only','All on, today differs']);");
+      C7_OAPPEND("c7d('display','weekday-order',['Sun to Sat','Sat to Sun','Mon to Sun','Sun to Mon']);");
       C7_OAPPEND("c7d('colors','color-source',['From effect','Main colour','Effect, no black']);");
       C7_OAPPEND("c7d('display','hour-format',['24 hour','12 hour']);");
       C7_OAPPEND("c7d('wiring','seg-preset',['Custom','F-A-B-G-E-D-C (default)','A-B-C-D-E-F-G','F-A-B-C-D-E-G']);");
