@@ -1,6 +1,6 @@
 name: Build Ashish Automation clock firmware
 
-# One run builds TWO firmware sets: WLED v0.14.4 and WLED v0.15.0
+# One run builds SEVEN firmware sets: WLED v0.14.4, v0.15.0, v0.15.1, v0.15.3, v0.15.4, v16.0.0 and v16.0.1
 on:
   workflow_dispatch:
 
@@ -14,10 +14,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - wled_tag: v0.14.4
-            node: 18
-          - wled_tag: v0.15.0
-            node: 20
+          - { wled_tag: v0.14.4, node: 18 }
+          - { wled_tag: v0.15.0, node: 20 }
+          - { wled_tag: v0.15.1, node: 20 }
+          - { wled_tag: v0.15.3, node: 20 }
+          - { wled_tag: v0.15.4, node: 20 }
+          - { wled_tag: v16.0.0, node: 20 }
+          - { wled_tag: v16.0.1, node: 20 }
     steps:
       - uses: actions/checkout@v4
         with:
@@ -33,21 +36,29 @@ jobs:
           cp -r mine/usermods/ashish_clock_7seg wled/usermods/
           cp mine/platformio_override.ini wled/platformio_override.ini
           cd wled
-          # old library pin that no longer resolves (needed for v0.14.4)
+          # old library pin that no longer resolves (harmless when not present)
           sed -i 's|ESPAsyncWebServer.git *@ *2.2.1|ESPAsyncWebServer.git#v2.2.1|' platformio.ini
           python3 - <<'PY'
-          p = "wled00/usermods_list.cpp"
-          s = open(p, encoding="utf-8").read()
-          add = "UsermodManager::add" if "UsermodManager::add" in s else "usermods.add"
-          s = s.replace('#include "wled.h"', '#include "wled.h"\n#ifdef USERMOD_ASHISH_CLOCK7SEG\n  #include "../usermods/ashish_clock_7seg/usermod_ashish_clock_7seg.h"\n#endif', 1)
-          i = s.index("void registerUsermods()")
-          j = s.index("{", i) + 1
-          s = s[:j] + "\n  #ifdef USERMOD_ASHISH_CLOCK7SEG\n  %s(new UsermodAshishClock7Seg());\n  #endif" % add + s[j:]
-          open(p, "w", encoding="utf-8").write(s)
-          print("usermod registered with", add)
-          # unique build number: WLED tags its web pages with VERSION, so browsers keep an OLD copy of
-          # the pages (welcome, info...) when the number never changes. +RUN_NUMBER makes every build new.
           import os, re
+          # ---- 1) register the usermod ----
+          if os.path.exists("wled00/usermods_list.cpp"):
+              # WLED 0.15.x: list file
+              p = "wled00/usermods_list.cpp"
+              s = open(p, encoding="utf-8").read()
+              add = "UsermodManager::add" if "UsermodManager::add" in s else "usermods.add"
+              s = s.replace('#include "wled.h"', '#include "wled.h"\n#ifdef USERMOD_ASHISH_CLOCK7SEG\n  #include "../usermods/ashish_clock_7seg/usermod_ashish_clock_7seg.h"\n#endif', 1)
+              i = s.index("void registerUsermods()")
+              j = s.index("{", i) + 1
+              s = s[:j] + "\n  #ifdef USERMOD_ASHISH_CLOCK7SEG\n  %s(new UsermodAshishClock7Seg());\n  #endif" % add + s[j:]
+              open(p, "w", encoding="utf-8").write(s)
+              print("usermod registered with", add, "(usermods_list.cpp)")
+          else:
+              # WLED 16.x: usermods are libraries listed in custom_usermods
+              d = "usermods/ashish_clock_7seg"
+              open(d + "/library.json", "w").write('{\n  "name": "ashish_clock_7seg",\n  "build": { "libArchive": false }\n}\n')
+              open(d + "/ashish_clock_7seg.cpp", "w").write('#include "usermod_ashish_clock_7seg.h"\n\nstatic UsermodAshishClock7Seg ashish_clock_7seg;\nREGISTER_USERMOD(ashish_clock_7seg);\n')
+              print("usermod registered as library (WLED 16 style): library.json + .cpp created")
+          # ---- 2) unique build number (browsers keep old pages when VERSION never changes) ----
           p = "wled00/wled.h"
           s = open(p, encoding="utf-8").read()
           m = re.search(r"#define VERSION (\d+)", s)
@@ -58,8 +69,8 @@ jobs:
               print("build number", m.group(1), "->", newv)
           else:
               print("WARNING: VERSION not found")
+          # ---- 3) welcome page name ----
           try:
-              import re
               p = "wled00/data/welcome.htm"
               s = open(p, encoding="utf-8").read()
               tag = '\n\t\t\t<h2 style="margin:0 0 14px 0;color:#ffb300;letter-spacing:1px"><b>Ashish Automation</b></h2>'
@@ -77,22 +88,20 @@ jobs:
               open(p, "w", encoding="utf-8").write(s)
           except Exception as e:
               print("WARNING welcome patch:", e)
+          # ---- 4) info page name (centred under the WLED version line) ----
           try:
               p = "wled00/data/index.js"
-              s = open(p, encoding="utf-8").read()
+              lines = open(p, encoding="utf-8").read().split("\n")
               tag = '<br><b style="font-size:22px;color:#ffb300">Ashish Automation</b>'
-              old = '"${vcn}"<br><br><table>'
-              if old in s:
-                  s = s.replace(old, '"${vcn}"' + tag + '<br><br><table>', 1)
-                  print("info page name added")
-              else:
-                  m = re.search(r"(\$\{i\.ver\}[^\n]*?)<br><br><table>", s)
-                  if m:
-                      s = s[:m.end(1)] + tag + s[m.end(1):]
-                      print("info page name added (regex)")
-                  else:
-                      print("WARNING: info page version line not found")
-              open(p, "w", encoding="utf-8").write(s)
+              done = False
+              for n, line in enumerate(lines):
+                  if "${i.ver}" in line and "<br><br><table>" in line:
+                      k = line.rfind("<br><br><table>")
+                      lines[n] = line[:k] + tag + line[k:]
+                      done = True
+                      break
+              open(p, "w", encoding="utf-8").write("\n".join(lines))
+              print("info page name added" if done else "WARNING: info page version line not found")
           except Exception as e:
               print("WARNING info patch:", e)
           PY
@@ -100,7 +109,10 @@ jobs:
           sed -i 's|^#define DEFAULT_AP_SSID .*|#define DEFAULT_AP_SSID     "CLOCK (Ashish Automation)"|' wled00/const.h
           sed -i 's|Connect to WLED-AP to setup again|Connect to CLOCK (Ashish Automation) to setup again|' wled00/set.cpp
           grep -n "DEFAULT_AP_SSID" wled00/const.h
-          grep -n "ASHISH\|Ashish" wled00/usermods_list.cpp
+          # default LED count 53 (the start LED count itself comes from the -D PIXEL_COUNTS=53 flag in platformio_override.ini)
+          sed -i -E 's|^([[:space:]]*)#define DEFAULT_LED_COUNT [0-9]+|\1#define DEFAULT_LED_COUNT 53|' wled00/const.h
+          grep -n "DEFAULT_LED_COUNT" wled00/const.h | head -3
+          ls usermods/ashish_clock_7seg
 
       - uses: actions/setup-node@v4
         with:
@@ -113,8 +125,7 @@ jobs:
           pip install platformio esptool
           cd wled
           npm ci
-          # WLED 0.14.4 ships ready-made page files and does not rebuild them: do it here so the
-          # welcome / info page changes are really inside the firmware (0.15.0 rebuilds by itself)
+          # rebuild the web pages so the page changes are really inside the firmware
           rm -f wled00/html_*.h
           npm run build
 
