@@ -14,13 +14,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { wled_tag: v0.14.4, node: 18 }
-          - { wled_tag: v0.15.0, node: 20 }
-          - { wled_tag: v0.15.1, node: 20 }
-          - { wled_tag: v0.15.3, node: 20 }
-          - { wled_tag: v0.15.4, node: 20 }
-          - { wled_tag: v16.0.0, node: 20 }
-          - { wled_tag: v16.0.1, node: 20 }
+          - { wled_tag: v0.14.4, node: 18, py: "3.11", pio_pinned: false }
+          - { wled_tag: v0.15.0, node: 20, py: "3.11", pio_pinned: false }
+          - { wled_tag: v0.15.1, node: 20, py: "3.11", pio_pinned: false }
+          - { wled_tag: v0.15.3, node: 20, py: "3.11", pio_pinned: false }
+          - { wled_tag: v0.15.4, node: 20, py: "3.11", pio_pinned: false }
+          # WLED 16 needs exactly the tool versions listed in its requirements.txt (PlatformIO 6.1.17, Python 3.12)
+          - { wled_tag: v16.0.0, node: 20, py: "3.12", pio_pinned: true }
+          - { wled_tag: v16.0.1, node: 20, py: "3.12", pio_pinned: true }
     steps:
       - uses: actions/checkout@v4
         with:
@@ -119,11 +120,19 @@ jobs:
           node-version: ${{ matrix.node }}
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.py }}
       - name: Install tools
         run: |
-          pip install platformio esptool
+          # esptool lives in its own environment so it can not disturb PlatformIO
+          python -m venv /tmp/esptoolenv
+          /tmp/esptoolenv/bin/pip install esptool
           cd wled
+          if [ "${{ matrix.pio_pinned }}" = "true" ]; then
+            pip install -r requirements.txt      # the exact PlatformIO version WLED 16 expects
+          else
+            pip install platformio
+          fi
+          pio --version
           npm ci
           # rebuild the web pages so the page changes are really inside the firmware
           rm -f wled00/html_*.h
@@ -178,7 +187,7 @@ jobs:
             PART=/tmp/partitions.bin
           fi
           echo "bootloader=$LOADER partitions=$PART boot_app0=$BOOT"
-          esptool --chip esp32 merge-bin -o "../out/Ashish_Clock_${TAG}_ESP32_first_install.bin" \
+          /tmp/esptoolenv/bin/esptool --chip esp32 merge-bin -o "../out/Ashish_Clock_${TAG}_ESP32_first_install.bin" \
             --flash-mode dio --flash-size 4MB \
             0x1000 "$LOADER" 0x8000 "$PART" 0xe000 "$BOOT" 0x10000 "$FW"
           ls -la ../out
