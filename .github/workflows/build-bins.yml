@@ -140,8 +140,22 @@ jobs:
 
       - name: Build ESP8266 (4MB) and ESP32
         run: |
+          # FIX for WLED 16: PlatformIO runs the esptool package "postinstall" script as the bare command
+          # "package-postinstall.py". The runner cannot find it (exit code 127) and the ESP32 build dies.
+          # This tiny helper on the PATH runs the real script from the package folder (or does nothing).
+          sudo tee /usr/local/bin/package-postinstall.py > /dev/null <<'EOS'
+          #!/bin/sh
+          if [ -f "./package-postinstall.py" ]; then python3 ./package-postinstall.py || true; fi
+          exit 0
+          EOS
+          sudo chmod +x /usr/local/bin/package-postinstall.py
           cd wled
-          pio run -e ashish_esp8266 -e ashish_esp32
+          # second try: a package that failed to finish installing is already unpacked, so a retry usually passes
+          for i in 1 2; do
+            if pio run -e ashish_esp8266 -e ashish_esp32; then break; fi
+            if [ "$i" = "2" ]; then echo "build failed twice"; exit 1; fi
+            echo "---- retrying build ----"
+          done
 
       - name: Build ESP8266 1MB (optional)
         continue-on-error: true
