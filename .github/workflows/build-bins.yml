@@ -156,6 +156,10 @@ jobs:
             if [ "$i" = "2" ]; then echo "build failed twice"; exit 1; fi
             echo "---- retrying build ----"
           done
+          # WLED 16 cleans the .pio build folder later, so keep the ESP32 boot files now (needed for the first-install file)
+          mkdir -p ../keep
+          cp -f .pio/build/ashish_esp32/bootloader.bin .pio/build/ashish_esp32/partitions.bin ../keep/ || true
+          ls -la ../keep
 
       - name: Build ESP8266 1MB (optional)
         continue-on-error: true
@@ -188,19 +192,26 @@ jobs:
         run: |
           cd wled
           TAG="${{ matrix.wled_tag }}"
-          B=.pio/build/ashish_esp32
           FW="../out/Ashish_Clock_${TAG}_ESP32_update.bin"
-          BOOT=$(find ~/.platformio/packages -name boot_app0.bin | head -1)
-          LOADER=$B/bootloader.bin
-          [ -f "$LOADER" ] || LOADER=$(find ~/.platformio/packages -name 'bootloader_dio_40m.bin' | head -1)
-          [ -f "$LOADER" ] || LOADER=$(find ~/.platformio/packages -name 'bootloader_*dio*40m*.bin' | head -1)
-          PART=$B/partitions.bin
-          if [ ! -f "$PART" ]; then
+          K=../keep
+          B=.pio/build/ashish_esp32
+          first() { for p in "$@"; do if [ -f "$p" ]; then echo "$p"; return 0; fi; done; return 0; }
+          # bootloader: saved copy, build folder, then search everywhere
+          LOADER=$(first "$K/bootloader.bin" "$B/bootloader.bin")
+          [ -n "$LOADER" ] || LOADER=$(find .pio build_output ~/.platformio/packages -name 'bootloader_dio_40m.bin' 2>/dev/null | head -1 || true)
+          [ -n "$LOADER" ] || LOADER=$(find .pio ~/.platformio/packages -name 'bootloader*.bin' 2>/dev/null | head -1 || true)
+          # partition table: saved copy, build folder, else generate it from WLED's csv
+          PART=$(first "$K/partitions.bin" "$B/partitions.bin")
+          if [ -z "$PART" ]; then
             GEN=$(find ~/.platformio/packages -name gen_esp32part.py | head -1)
             python "$GEN" tools/WLED_ESP32_4MB_1MB_FS.csv /tmp/partitions.bin
             PART=/tmp/partitions.bin
           fi
-          echo "bootloader=$LOADER partitions=$PART boot_app0=$BOOT"
+          BOOT=$(find ~/.platformio/packages -name boot_app0.bin | head -1 || true)
+          echo "bootloader=$LOADER partitions=$PART boot_app0=$BOOT firmware=$FW"
+          for f in "$LOADER" "$PART" "$BOOT" "$FW"; do
+            if [ -z "$f" ] || [ ! -f "$f" ]; then echo "ERROR: a file needed for the first-install bin is missing (see line above)"; exit 1; fi
+          done
           /tmp/esptoolenv/bin/esptool --chip esp32 merge-bin -o "../out/Ashish_Clock_${TAG}_ESP32_first_install.bin" \
             --flash-mode dio --flash-size 4MB \
             0x1000 "$LOADER" 0x8000 "$PART" 0xe000 "$BOOT" 0x10000 "$FW"
