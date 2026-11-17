@@ -126,7 +126,7 @@ class UsermodAshishClock7Seg : public Usermod {
     int8_t  rtcSda       = C7_DEF_SDA;
     int8_t  rtcScl       = C7_DEF_SCL;
     uint8_t rtcSyncHours = 6;
-    bool    rereadOn     = true;   // re-read RTC when there is no internet time
+    bool    rereadOn     = true;   // keep the clock aligned to the RTC (always, except 15 min after an NTP sync)
     uint8_t rereadMin    = 2;      // minutes between re-reads
 
     uint8_t testMode     = 0;      // 0 off, 1 all on, 2 segment walk, 3 digit count
@@ -632,6 +632,10 @@ class UsermodAshishClock7Seg : public Usermod {
 
     bool internetOk() const { return WLED_CONNECTED && ntpEnabled && ntpLastSyncTime != NTP_NEVER && (millis() - ntpLastSyncTime) < 45000000UL; }
 
+    // true only for 15 minutes after a real NTP sync. After that the clock is re-aligned to the RTC again,
+    // so the ESP's own quartz drift (seconds per day) can no longer pile up while the internet is gone.
+    bool ntpFresh() const { return WLED_CONNECTED && ntpEnabled && ntpLastSyncTime != NTP_NEVER && (millis() - ntpLastSyncTime) < 900000UL; }
+
     bool tempUsable() const { return tempShow && tempC > -90.0f && ((tempSource == 0 && rtcReady && rtcChip == 1) || (tempSource == 1 && bmpReady)); }
 
     uint8_t displayState() {   // 0 time, 1 day+month, 2 year, 3 temperature, 5 battery warning
@@ -788,7 +792,7 @@ class UsermodAshishClock7Seg : public Usermod {
       int32_t sysMs = (int32_t)toki.getTime().ms;
       int32_t offMs = (int32_t)((uint32_t)toki.second() - (uint32_t)t1) * 1000 + sysMs - 10;   // + = clock ahead of the RTC
       rtcDiffMs = offMs; lastRereadAt = now; if (rereadCount < 65535) rereadCount++;
-      if (offMs >= 150 || offMs <= -150) { toki.setTime(t1, 10, TOKI_TS_RTC); updateLocalTime(); }
+      if (offMs >= 100 || offMs <= -100) { toki.setTime(t1, 10, TOKI_TS_RTC); updateLocalTime(); }
       syncState = 0;
     }
 
@@ -812,13 +816,14 @@ class UsermodAshishClock7Seg : public Usermod {
         if (battCheck && now - lastBattCheck > 60000UL) { lastBattCheck = now; rtcCheckBattery(); }
         if (!rtcLoaded && now - lastRtcTry > 10000) { lastRtcTry = now; rtcLoadToWled(); }
 
-        // internet time good? (WiFi up, NTP on, synced in the last ~12 h)
-        bool online = internetOk();
-        if (online) { if (offline) { offline = false; rtcWritten = false; } }   // internet is back: update RTC soon
+        // internet time just synced (last 15 min)? then it is the master and the RTC is updated from it
+        bool online = ntpFresh();
+        if (online) { if (offline) { offline = false; rtcWritten = false; } }   // fresh NTP time: write it to the RTC soon
         else offline = true;
+        if (online && syncState) syncState = 0;                  // never let an old RTC edge overwrite fresh NTP time
 
-        // no internet time: every N minutes read the RTC, then wait for its next second edge and
-        // align the clock to it (accuracy about 0.02 s). Only moved when 0.15 s or more off.
+        // otherwise (no internet, or the last NTP sync is older than 15 min): every N minutes read the RTC,
+        // wait for its next second edge and align the clock to it (accuracy about 0.02 s). Only moved when 0.1 s or more off.
         if (rereadOn && !online && syncState == 0 && now - lastReread >= (unsigned long)rereadMin * 60000UL) {
           lastReread = now;
           time_t rt;
@@ -1005,9 +1010,9 @@ class UsermodAshishClock7Seg : public Usermod {
       JsonArray a5b = user.createNestedArray(F("Clock RTC re-read"));
       if (!rtcEnabled || !rtcReady) a5b.add(F("n/a"));
       else if (!rereadOn) a5b.add(F("off"));
-      else if (internetOk()) a5b.add(F("not needed (internet time OK)"));
+      else if (ntpFresh()) a5b.add(F("not needed (internet time just synced)"));
       else if (rereadCount == 0) { snprintf(b, sizeof(b), "every %d min, waiting", rereadMin); a5b.add(String(b)); }
-      else { char bb[72]; snprintf(bb, sizeof(bb), "every %d min, last diff %ld ms, bad reads %d", rereadMin, (long)rtcDiffMs, (int)rtcBadReads); a5b.add(String(bb)); }
+      else { char bb[72]; snprintf(bb, sizeof(bb), "every %d min, last diff %ld ms, checks %d, bad reads %d", rereadMin, (long)rtcDiffMs, (int)rereadCount, (int)rtcBadReads); a5b.add(String(bb)); }
 
       // 5c) RTC battery / time warning
       JsonArray a5c = user.createNestedArray(F("Clock RTC battery"));
