@@ -126,6 +126,7 @@ class UsermodAshishClock7Seg : public Usermod {
     int8_t  rtcSda       = C7_DEF_SDA;
     int8_t  rtcScl       = C7_DEF_SCL;
     uint8_t rtcSyncHours = 6;
+    uint8_t rtcMaster    = 0;      // 0 = the clock keeps time and refreshes the RTC every hour (best for DS1307), 1 = the clock follows the RTC
     int16_t rtcTrim      = 0;      // seconds per day the RTC chip gains (+) or loses (-); the clock corrects it
     bool    rereadOn     = true;   // keep the clock aligned to the RTC (always, except 15 min after an NTP sync)
     uint8_t rereadMin    = 2;      // minutes between re-reads
@@ -164,6 +165,10 @@ class UsermodAshishClock7Seg : public Usermod {
     unsigned long rtcErrAt = 0, trimLastMs = 0;
     float    trimAccMs   = 0;
     uint16_t trimSteps   = 0;
+    bool     bootAligned = false;  // clock phase already aligned to the RTC once after start
+    uint8_t  lastSrc     = 0;
+    uint32_t lastChkSec  = 0;
+    unsigned long lastChkMs = 0;
     unsigned long lastReread = 0, lastRereadAt = 0;
     uint8_t  ampmMask    = 0;
     uint32_t mainCol     = 0xFFFFFF;
@@ -439,6 +444,7 @@ class UsermodAshishClock7Seg : public Usermod {
           if (tempSource == 1) bmpReady = bmpInit();
         }
       }
+      bootAligned = false;
       lastReread = millis() - (unsigned long)rereadMin * 60000UL + 3000UL;      // first RTC alignment 3 s after start (if offline)
       #ifndef ESP8266
       if (autoBri && ldrPin >= 0) {
@@ -780,6 +786,11 @@ class UsermodAshishClock7Seg : public Usermod {
     }
 
   public:
+    // WiFi / hotspot (re)connected: ask for internet time right now (WLED itself only asks again after ~12 hours)
+    void connected() {
+      ntpLastSyncTime = NTP_NEVER;
+    }
+
     void setup() {
       setupDone = true;
       buildOrder();
@@ -809,6 +820,7 @@ class UsermodAshishClock7Seg : public Usermod {
         }
         return;
       }
+      bootAligned = true;
       rtcDiffMs = offMs; lastRereadAt = now; if (rereadCount < 65535) rereadCount++;
       if (offMs >= 100 || offMs <= -100) { toki.setTime(t1, 10, TOKI_TS_RTC); updateLocalTime(); }
       if (rtcTrim != 0) {                                      // RTC chip gains/loses seconds: step it back 1 s when it is a full second off
@@ -830,6 +842,9 @@ class UsermodAshishClock7Seg : public Usermod {
       if (now - lastTick < 100) return;
       lastTick = now;
 
+      // internet time: ask again every hour (WLED default is ~12 h) so the clock never drifts more than a fraction of a second
+      if (ntpEnabled && WLED_CONNECTED && ntpLastSyncTime != NTP_NEVER && now - ntpLastSyncTime > 3600000UL) ntpLastSyncTime = NTP_NEVER;
+
       // temperature sensor (every 10 s)
       if (now - lastTemp > 10000) {
         lastTemp = now;
@@ -846,6 +861,13 @@ class UsermodAshishClock7Seg : public Usermod {
         bool online = ntpFresh();
         if (online) { if (offline) { offline = false; rtcWritten = false; errChecked = false; } }   // fresh NTP time: measure the RTC error, then write NTP time to the RTC
         else offline = true;
+        uint8_t src = toki.getTimeSource();
+        if (online || src > TOKI_TS_RTC) bootAligned = true;     // clock already has a better time than the RTC: no boot alignment needed
+        if (src > TOKI_TS_RTC && lastChkMs) {                    // time set from phone / browser (jump): copy it to the RTC soon
+          int32_t dj = (int32_t)(toki.second() - lastChkSec) - (int32_t)((now - lastChkMs) / 1000UL);
+          if (dj > 2 || dj < -1) rtcWritten = false;
+        }
+        lastChkSec = toki.second(); lastChkMs = now; lastSrc = src;
         if (online && syncState && !syncMeasure) syncState = 0;  // never let an old RTC edge overwrite fresh NTP time
         if (online && !errChecked && syncState == 0 && rtcLoaded && toki.getTimeSource() > TOKI_TS_RTC) {
           errChecked = true;                                     // once per NTP sync: compare the RTC with the internet time (before it is overwritten)
@@ -855,15 +877,17 @@ class UsermodAshishClock7Seg : public Usermod {
 
         // otherwise (no internet, or the last NTP sync is older than 15 min): every N minutes read the RTC,
         // wait for its next second edge and align the clock to it (accuracy about 0.02 s). Only moved when 0.1 s or more off.
-        if (rereadOn && !online && syncState == 0 && now - lastReread >= (unsigned long)rereadMin * 60000UL) {
+        if (rereadOn && !online && syncState == 0 && (rtcMaster == 1 || !bootAligned) && now - lastReread >= (unsigned long)rereadMin * 60000UL) {
           lastReread = now;
           time_t rt;
           if (rtcRead(rt)) { syncBase = rt; syncState = 1; syncStart = now; syncPollAt = 0; }
         }
 
-        uint8_t src = toki.getTimeSource();
-        if (src > TOKI_TS_RTC && !(syncState && syncMeasure) && (lastRtcWriteTry == 0 || now - lastRtcWriteTry > 30000UL)) {   // time came from NTP / browser
-          bool due = !rtcWritten || (rtcSyncHours > 0 && now - lastRtcWrite > (unsigned long)rtcSyncHours * 3600000UL);
+        // RTC write: always when the time came from NTP / phone. In "clock is master" mode also when the clock runs on its own
+        // (after it was aligned to the RTC once), refreshed every hour, so a poor RTC (DS1307) can not make the clock drift.
+        bool srcOk = src > TOKI_TS_RTC || (rtcMaster == 0 && src == TOKI_TS_RTC && bootAligned);
+        if (srcOk && !(syncState && syncMeasure) && (lastRtcWriteTry == 0 || now - lastRtcWriteTry > 30000UL)) {
+          bool due = !rtcWritten || (rtcMaster == 0 ? (now - lastRtcWrite > 3600000UL) : (rtcSyncHours > 0 && now - lastRtcWrite > (unsigned long)rtcSyncHours * 3600000UL));
           if (due && toki.isTick()) {
             lastRtcWriteTry = now ? now : 1;
             bool ok = false;
@@ -1041,6 +1065,7 @@ class UsermodAshishClock7Seg : public Usermod {
       JsonArray a5b = user.createNestedArray(F("Clock RTC re-read"));
       if (!rtcEnabled || !rtcReady) a5b.add(F("n/a"));
       else if (!rereadOn) a5b.add(F("off"));
+      else if (rtcMaster == 0) { char bm[64]; snprintf(bm, sizeof(bm), "clock is master, RTC refreshed hourly (aligned %d x)", (int)rereadCount); a5b.add(String(bm)); }
       else if (ntpFresh()) a5b.add(F("not needed (internet time just synced)"));
       else if (rereadCount == 0) { snprintf(b, sizeof(b), "every %d min, waiting", rereadMin); a5b.add(String(b)); }
       else { char bb[72]; snprintf(bb, sizeof(bb), "every %d min, last diff %ld ms, checks %d, bad reads %d", rereadMin, (long)rtcDiffMs, (int)rereadCount, (int)rtcBadReads); a5b.add(String(bb)); }
@@ -1248,6 +1273,7 @@ class UsermodAshishClock7Seg : public Usermod {
       r[F("sda-pin")] = rtcSda;
       r[F("scl-pin")] = rtcScl;
       r[F("sync-hours")] = rtcSyncHours;
+      r[F("master")] = rtcMaster;
       r[F("trim-sec-day")] = rtcTrim;
       r[F("reread-on")] = rereadOn;
       r[F("reread-min")] = rereadMin;
@@ -1374,6 +1400,7 @@ class UsermodAshishClock7Seg : public Usermod {
       ok &= getJsonValue(r[F("sda-pin")], rtcSda, (int8_t)C7_DEF_SDA);
       ok &= getJsonValue(r[F("scl-pin")], rtcScl, (int8_t)C7_DEF_SCL);
       ok &= getJsonValue(r[F("sync-hours")], rtcSyncHours, (uint8_t)6);
+      ok &= getJsonValue(r[F("master")], rtcMaster, (uint8_t)0);
       ok &= getJsonValue(r[F("trim-sec-day")], rtcTrim, (int16_t)0);
       ok &= getJsonValue(r[F("reread-on")], rereadOn, true);
       ok &= getJsonValue(r[F("reread-min")], rereadMin, (uint8_t)2);
@@ -1406,6 +1433,7 @@ class UsermodAshishClock7Seg : public Usermod {
       chimeStart %= 24; chimeEnd %= 24;
       nightStart %= 24; nightEnd %= 24;
       rtcChip = rtcChip ? 1 : 0;
+      rtcMaster = rtcMaster ? 1 : 0;
       rtcTrim = constrain(rtcTrim, -300, 300); trimAccMs = 0; trimLastMs = 0;
       testMode = testMode > 3 ? 0 : testMode;
 
@@ -1433,6 +1461,7 @@ class UsermodAshishClock7Seg : public Usermod {
       C7_OAPPEND("c7d('alarm','days',['Every day','Mon-Fri','Sat-Sun']);");
       C7_OAPPEND("c7d('night','action',['Off','Dim','Keep on']);");
       C7_OAPPEND("c7d('rtc','chip',['DS1307','DS3231']);");
+      C7_OAPPEND("c7d('rtc','master',['Clock (RTC follows)','RTC (clock follows)']);");
       C7_OAPPEND("c7d('test','mode',['Off','All ON','Seg walk','Digit count']);");
       C7_OAPPEND("c7i('wiring','seg-order','Used if preset = Custom');");
       C7_OAPPEND("c7i('wiring','leds-per-colon','LEDs in ONE colon');");
