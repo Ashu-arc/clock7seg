@@ -125,10 +125,12 @@ class UsermodAshishClock7Seg : public Usermod {
     uint8_t rtcChip      = 0;      // 0 = DS1307, 1 = DS3231
     int8_t  rtcSda       = C7_DEF_SDA;
     int8_t  rtcScl       = C7_DEF_SCL;
-    uint8_t rtcSyncHours = 6;
-    uint8_t rtcMaster    = 0;      // 0 = the clock keeps time and refreshes the RTC every hour (best for DS1307), 1 = the clock follows the RTC
+    uint8_t rtcSyncHours = 2;      // ONLINE: write internet time to the RTC every N hours
+    bool    freeRun      = false;  // false = AUTO: internet time when online, RTC when offline (recommended). true = old mode: clock free-runs, RTC copies it
+    uint8_t ntpPollMin   = 15;     // ONLINE: ask the internet time server every N minutes (5..240)
+    bool    trimAuto     = true;   // learn the RTC drift (trim) by itself after every internet outage
     int16_t rtcTrim      = 0;      // seconds per day the RTC chip gains (+) or loses (-); the clock corrects it
-    bool    rereadOn     = true;   // keep the clock aligned to the RTC (always, except 15 min after an NTP sync)
+    bool    rereadOn     = true;   // OFFLINE: keep the clock aligned to the RTC
     uint8_t rereadMin    = 2;      // minutes between re-reads
 
     uint8_t testMode     = 0;      // 0 off, 1 all on, 2 segment walk, 3 digit count
@@ -157,6 +159,9 @@ class UsermodAshishClock7Seg : public Usermod {
     time_t   syncBase    = 0;
     unsigned long syncStart = 0, syncPollAt = 0, lastRtcWriteTry = 0;
     uint16_t rereadCount = 0;
+    unsigned long ntpSeen = 0xFFFFFFFEUL, ntpOkAt = 0, ntpForceAt = 0, ntpTryAt = 0;   // internet time tracking
+    bool     ntpEverOk = false, ntpForcing = false;
+    int16_t  trimSaved = 0;
     bool     syncMeasure = false;  // edge measurement only (compare RTC with fresh internet time), no clock change
     bool     errChecked  = true;   // RTC error vs internet already measured for this NTP sync
     bool     rtcErrValid = false, rtcSuggestValid = false;
@@ -645,11 +650,35 @@ class UsermodAshishClock7Seg : public Usermod {
       return nightStart < nightEnd ? (h >= nightStart && h < nightEnd) : (h >= nightStart || h < nightEnd);
     }
 
-    bool internetOk() const { return WLED_CONNECTED && ntpEnabled && ntpLastSyncTime != NTP_NEVER && (millis() - ntpLastSyncTime) < 45000000UL; }
+    // ONLINE = WiFi up AND the internet time server really ANSWERED within the last poll interval (+3 min).
+    // (old code: "online" for 12.5 h after the last answer even when the internet was already gone, so the
+    //  clock never went back to the RTC and the ESP's own crystal drift piled up for hours)
+    bool ntpFresh() const {
+      return WLED_CONNECTED && ntpEnabled && ntpEverOk && (millis() - ntpOkAt) < ((unsigned long)ntpPollMin * 60000UL + 180000UL);
+    }
+    bool internetOk() const { return ntpFresh(); }
 
-    // true only for 15 minutes after a real NTP sync. After that the clock is re-aligned to the RTC again,
-    // so the ESP's own quartz drift (seconds per day) can no longer pile up while the internet is gone.
-    bool ntpFresh() const { return WLED_CONNECTED && ntpEnabled && ntpLastSyncTime != NTP_NEVER && (millis() - ntpLastSyncTime) < 900000UL; }
+    // Watches WLED's NTP sync and makes WLED ask the time server every ntpPollMin minutes
+    // (the core asks only every ~11.7 h). When the server does not answer within 25 s it stops asking,
+    // so WLED does not hammer a dead network every 10 s (that froze the LEDs for a moment each time).
+    void ntpWatch(unsigned long now) {
+      unsigned long v = ntpLastSyncTime;
+      if (v != ntpSeen) {                                      // changed: the core got a real answer (or a new query was requested)
+        ntpSeen = v;
+        if (v != NTP_NEVER) { ntpOkAt = v; ntpEverOk = true; ntpForcing = false; }
+      }
+      if (!ntpEnabled || !WLED_CONNECTED) { ntpForcing = false; return; }
+      if (ntpForcing) {
+        if (now - ntpForceAt > 25000UL) { ntpLastSyncTime = now; ntpSeen = now; ntpForcing = false; }   // no answer: pause, try again later
+        return;
+      }
+      if (ntpLastSyncTime == NTP_NEVER) { ntpForcing = true; ntpForceAt = now; ntpTryAt = now; return; } // WLED is already asking (boot, WiFi back)
+      unsigned long poll = (unsigned long)ntpPollMin * 60000UL;
+      if (now - ntpOkAt >= poll && now - ntpTryAt >= poll) {
+        ntpLastSyncTime = NTP_NEVER; ntpSeen = NTP_NEVER;      // the same trick WLED uses itself to force an NTP query
+        ntpForcing = true; ntpForceAt = now; ntpTryAt = now;
+      }
+    }
 
     bool tempUsable() const { return tempShow && tempC > -90.0f && ((tempSource == 0 && rtcReady && rtcChip == 1) || (tempSource == 1 && bmpReady)); }
 
@@ -799,37 +828,71 @@ class UsermodAshishClock7Seg : public Usermod {
       if (configRead) initHw();
     }
 
-    // Waits (non-blocking) for the RTC second to change, then aligns the clock to that exact moment
+    // Waits (non-blocking) for the RTC second to change, then either
+    //  - aligns the clock to that exact moment (OFFLINE: the RTC is the master), or
+    //  - measures how far the RTC is off compared with fresh internet time (syncMeasure)
     void pollEdge(unsigned long now) {
       if (now - syncPollAt < 20) return;
+      unsigned long prevPoll = syncPollAt;
       syncPollAt = now;
       if (now - syncStart > 1600) { syncState = 0; syncMeasure = false; return; }   // RTC second never changed: give up
       time_t t1, t2;
       if (rtcReadOnce(t1) != 0) return;
       if (t1 != syncBase + 1) return;                          // not the next second yet (or noise)
       if (rtcReadOnce(t2) != 0 || t2 != t1) return;            // confirm with a second read
-      // the RTC second changed within the last ~20 ms
-      int32_t sysMs = (int32_t)toki.getTime().ms;
-      int32_t offMs = (int32_t)((uint32_t)toki.second() - (uint32_t)t1) * 1000 + sysMs - 10;   // + = clock ahead of the RTC
+      unsigned long tDet = millis();
+      // the RTC second changed somewhere between the previous poll and now: take the middle
+      unsigned long gap = tDet - prevPoll;
+      int32_t edgeAgo = (prevPoll == 0 || gap > 100) ? 10 : (int32_t)(gap / 2);
+      Toki::Time st = toki.getTime();                          // seconds + ms taken together (no second roll-over between two calls)
+      int64_t sysTotal = (int64_t)st.sec * 1000 + st.ms;
+      int32_t offRaw = (int32_t)(sysTotal - ((int64_t)t1 * 1000 + edgeAgo));    // + = clock ahead of the raw RTC reading
+
       if (syncMeasure) {                                       // fresh internet time is the truth: how wrong is the RTC?
         syncMeasure = false; syncState = 0;
-        rtcErrMs = -offMs; rtcErrAt = now; rtcErrValid = true;
+        rtcErrMs = -offRaw; rtcErrAt = now; rtcErrValid = true;
         if (lastRtcWrite != 0 && now - lastRtcWrite >= 3600000UL) {
-          float perDay = (float)rtcErrMs * 86400.0f / (float)(now - lastRtcWrite);
+          unsigned long E = now - lastRtcWrite;                // time since the RTC was last set from the internet
+          if (rtcTrim != 0 && trimLastMs) trimAccMs += (float)rtcTrim * (float)(now - trimLastMs) / 86400.0f;
+          trimLastMs = now;
+          float perDay = ((float)rtcErrMs - trimAccMs) * 86400.0f / (float)E;     // drift that the trim did NOT explain (s/day)
           rtcSuggest = (int)lroundf((float)rtcTrim + perDay); rtcSuggestValid = true;
+          if (trimAuto && E >= 7200000UL && fabsf(perDay) < 200.0f) {             // learn the RTC drift by itself
+            float w = (E >= 21600000UL) ? 1.0f : 0.5f;
+            int nt = (int)lroundf((float)rtcTrim + w * perDay);
+            nt = constrain(nt, -300, 300);
+            if (nt != rtcTrim) { rtcTrim = (int16_t)nt; if (nt != trimSaved) { trimSaved = (int16_t)nt; doSerializeConfig = true; } }
+          }
         }
         return;
       }
+
+      // ---- OFFLINE: the RTC is the master, the clock follows it ----
       bootAligned = true;
-      rtcDiffMs = offMs; lastRereadAt = now; if (rereadCount < 65535) rereadCount++;
-      if (offMs >= 100 || offMs <= -100) { toki.setTime(t1, 10, TOKI_TS_RTC); updateLocalTime(); }
-      if (rtcTrim != 0) {                                      // RTC chip gains/loses seconds: step it back 1 s when it is a full second off
-        if (trimLastMs) trimAccMs += (float)rtcTrim * (float)(now - trimLastMs) / 86400.0f;   // ms
+      lastRereadAt = now; if (rereadCount < 65535) rereadCount++;
+      int32_t accMs = 0;                                       // how far the RTC chip is estimated to be ahead of the real time (ms)
+      if (rtcTrim != 0) {
+        if (trimLastMs) trimAccMs += (float)rtcTrim * (float)(now - trimLastMs) / 86400.0f;
         trimLastMs = now;
-        int8_t step = 0;
-        if (trimAccMs >= 1000.0f) { step = -1; trimAccMs -= 1000.0f; }
-        else if (trimAccMs <= -1000.0f) { step = 1; trimAccMs += 1000.0f; }
-        if (step && rtcWrite(t1 + step)) { toki.setTime(t1 + step, 10, TOKI_TS_RTC); updateLocalTime(); rtcDiffMs = 0; if (trimSteps < 65535) trimSteps++; }
+        accMs = (int32_t)lroundf(trimAccMs);
+      }
+      int64_t truthMs = (int64_t)t1 * 1000 + edgeAgo - accMs;  // real time at the moment the RTC second changed (+ edgeAgo)
+      int32_t offMs = (int32_t)(sysTotal - truthMs);           // + = clock ahead of the real time
+      rtcDiffMs = offMs;
+
+      // RTC chip gains/loses whole seconds: step it back so it never drifts more than 1 s away from the real time
+      int32_t whole = (int32_t)(trimAccMs / 1000.0f);
+      if (whole > 5) whole = 5;
+      if (whole < -5) whole = -5;
+      if (rtcTrim != 0 && whole != 0 && rtcWrite((time_t)(t1 - whole))) {
+        trimAccMs -= (float)whole * 1000.0f;
+        if (trimSteps < 65535) trimSteps++;
+      }
+
+      if (offMs >= 100 || offMs <= -100) {
+        int64_t total = truthMs + (int64_t)(millis() - tDet);  // now
+        Toki::Time tt; tt.sec = (uint32_t)(total / 1000); tt.ms = (uint16_t)(total % 1000);
+        toki.setTime(tt, TOKI_TS_RTC); updateLocalTime();
       }
       syncState = 0;
     }
@@ -842,8 +905,8 @@ class UsermodAshishClock7Seg : public Usermod {
       if (now - lastTick < 100) return;
       lastTick = now;
 
-      // internet time: ask again every hour (WLED default is ~12 h) so the clock never drifts more than a fraction of a second
-      if (ntpEnabled && WLED_CONNECTED && ntpLastSyncTime != NTP_NEVER && now - ntpLastSyncTime > 3600000UL) ntpLastSyncTime = NTP_NEVER;
+      // internet time: ask every ntpPollMin minutes (WLED default is ~12 h) and track whether the server really answers
+      ntpWatch(now);
 
       // temperature sensor (every 10 s)
       if (now - lastTemp > 10000) {
@@ -857,7 +920,8 @@ class UsermodAshishClock7Seg : public Usermod {
         if (battCheck && now - lastBattCheck > 60000UL) { lastBattCheck = now; rtcCheckBattery(); }
         if (!rtcLoaded && now - lastRtcTry > 10000) { lastRtcTry = now; rtcLoadToWled(); }
 
-        // internet time just synced (last 15 min)? then it is the master and the RTC is updated from it
+        // ONLINE (the time server answered within the last poll interval)? then internet time is the master and the RTC is
+        // updated from it. OFFLINE: the RTC is the master and the clock follows it (see below).
         bool online = ntpFresh();
         if (online) { if (offline) { offline = false; rtcWritten = false; errChecked = false; } }   // fresh NTP time: measure the RTC error, then write NTP time to the RTC
         else offline = true;
@@ -872,22 +936,27 @@ class UsermodAshishClock7Seg : public Usermod {
         if (online && !errChecked && syncState == 0 && rtcLoaded && toki.getTimeSource() > TOKI_TS_RTC) {
           errChecked = true;                                     // once per NTP sync: compare the RTC with the internet time (before it is overwritten)
           time_t rt;
-          if (rtcRead(rt)) { syncBase = rt; syncState = 1; syncMeasure = true; syncStart = now; syncPollAt = 0; }
+          if (rtcRead(rt)) { syncBase = rt; syncState = 1; syncMeasure = true; syncStart = now; syncPollAt = now; }
         }
 
-        // otherwise (no internet, or the last NTP sync is older than 15 min): every N minutes read the RTC,
-        // wait for its next second edge and align the clock to it (accuracy about 0.02 s). Only moved when 0.1 s or more off.
-        if (rereadOn && !online && syncState == 0 && (rtcMaster == 1 || !bootAligned) && now - lastReread >= (unsigned long)rereadMin * 60000UL) {
+        // OFFLINE: every N minutes read the RTC, wait for its next second edge and align the clock to it
+        // (accuracy about 0.02 s, RTC drift trim included). Only moved when 0.1 s or more off.
+        // This runs the whole time the internet is gone, so the ESP's own crystal drift can never pile up.
+        // (freeRun = old mode: aligned only once after power on)
+        if (rereadOn && !online && syncState == 0 && (!freeRun || !bootAligned) && now - lastReread >= (unsigned long)rereadMin * 60000UL) {
           lastReread = now;
           time_t rt;
-          if (rtcRead(rt)) { syncBase = rt; syncState = 1; syncStart = now; syncPollAt = 0; }
+          if (rtcRead(rt)) { syncBase = rt; syncState = 1; syncStart = now; syncPollAt = now; }
         }
 
-        // RTC write: always when the time came from NTP / phone. In "clock is master" mode also when the clock runs on its own
-        // (after it was aligned to the RTC once), refreshed every hour, so a poor RTC (DS1307) can not make the clock drift.
-        bool srcOk = src > TOKI_TS_RTC || (rtcMaster == 0 && src == TOKI_TS_RTC && bootAligned);
+        // RTC write (RTC <- clock). AUTO mode: ONLY when the clock holds good time: fresh internet time (every sync-hours),
+        // or a time you set from the phone / browser. NEVER when the clock merely free-runs on the ESP crystal,
+        // otherwise its drift would be copied into the RTC (that was the "seconds too fast after some hours offline" bug).
+        bool srcOk = src > TOKI_TS_RTC || (freeRun && src == TOKI_TS_RTC && bootAligned);
         if (srcOk && !(syncState && syncMeasure) && (lastRtcWriteTry == 0 || now - lastRtcWriteTry > 30000UL)) {
-          bool due = !rtcWritten || (rtcMaster == 0 ? (now - lastRtcWrite > 3600000UL) : (rtcSyncHours > 0 && now - lastRtcWrite > (unsigned long)rtcSyncHours * 3600000UL));
+          bool due;
+          if (freeRun) due = !rtcWritten || (now - lastRtcWrite > 3600000UL);
+          else         due = !rtcWritten || (online && src >= TOKI_TS_NTP && rtcSyncHours > 0 && now - lastRtcWrite > (unsigned long)rtcSyncHours * 3600000UL);
           if (due && toki.isTick()) {
             lastRtcWriteTry = now ? now : 1;
             bool ok = false;
@@ -896,7 +965,7 @@ class UsermodAshishClock7Seg : public Usermod {
               delay(3);
               if (rtcRead(chk)) { int32_t d = (int32_t)((uint32_t)chk - (uint32_t)toki.second()); ok = (d >= -2 && d <= 2); }
             }
-            if (ok) { rtcWritten = true; lastRtcWrite = now; } else rtcWritten = false;           // retry in 30 s
+            if (ok) { rtcWritten = true; lastRtcWrite = now; trimAccMs = 0; trimLastMs = now; } else rtcWritten = false;   // RTC is exact now; retry in 30 s if it failed
           }
         }
       }
@@ -1065,10 +1134,10 @@ class UsermodAshishClock7Seg : public Usermod {
       JsonArray a5b = user.createNestedArray(F("Clock RTC re-read"));
       if (!rtcEnabled || !rtcReady) a5b.add(F("n/a"));
       else if (!rereadOn) a5b.add(F("off"));
-      else if (rtcMaster == 0) { char bm[64]; snprintf(bm, sizeof(bm), "clock is master, RTC refreshed hourly (aligned %d x)", (int)rereadCount); a5b.add(String(bm)); }
-      else if (ntpFresh()) a5b.add(F("not needed (internet time just synced)"));
-      else if (rereadCount == 0) { snprintf(b, sizeof(b), "every %d min, waiting", rereadMin); a5b.add(String(b)); }
-      else { char bb[72]; snprintf(bb, sizeof(bb), "every %d min, last diff %ld ms, checks %d, bad reads %d", rereadMin, (long)rtcDiffMs, (int)rereadCount, (int)rtcBadReads); a5b.add(String(bb)); }
+      else if (freeRun) { char bm[64]; snprintf(bm, sizeof(bm), "free-running (old mode), aligned %d x", (int)rereadCount); a5b.add(String(bm)); }
+      else if (ntpFresh()) { snprintf(b, sizeof(b), "ONLINE - internet time master (synced %d min ago)", (int)((millis() - ntpOkAt) / 60000UL)); a5b.add(String(b)); }
+      else if (rereadCount == 0) { snprintf(b, sizeof(b), "OFFLINE - RTC master, every %d min, waiting", rereadMin); a5b.add(String(b)); }
+      else { char bb[84]; snprintf(bb, sizeof(bb), "OFFLINE - RTC master, every %d min, last diff %ld ms, checks %d, bad reads %d", rereadMin, (long)rtcDiffMs, (int)rereadCount, (int)rtcBadReads); a5b.add(String(bb)); }
 
       // 5e) RTC accuracy measured against internet time
       JsonArray a5e = user.createNestedArray(F("Clock RTC accuracy"));
@@ -1273,8 +1342,10 @@ class UsermodAshishClock7Seg : public Usermod {
       r[F("sda-pin")] = rtcSda;
       r[F("scl-pin")] = rtcScl;
       r[F("sync-hours")] = rtcSyncHours;
-      r[F("master")] = rtcMaster;
+      r[F("clock-free-run")] = freeRun;
+      r[F("ntp-poll-min")] = ntpPollMin;
       r[F("trim-sec-day")] = rtcTrim;
+      r[F("trim-auto")] = trimAuto;
       r[F("reread-on")] = rereadOn;
       r[F("reread-min")] = rereadMin;
       r[F("battery-check")] = battCheck;
@@ -1399,9 +1470,11 @@ class UsermodAshishClock7Seg : public Usermod {
       ok &= getJsonValue(r[F("chip")], rtcChip, (uint8_t)0);
       ok &= getJsonValue(r[F("sda-pin")], rtcSda, (int8_t)C7_DEF_SDA);
       ok &= getJsonValue(r[F("scl-pin")], rtcScl, (int8_t)C7_DEF_SCL);
-      ok &= getJsonValue(r[F("sync-hours")], rtcSyncHours, (uint8_t)6);
-      ok &= getJsonValue(r[F("master")], rtcMaster, (uint8_t)0);
+      ok &= getJsonValue(r[F("sync-hours")], rtcSyncHours, (uint8_t)2);
+      ok &= getJsonValue(r[F("clock-free-run")], freeRun, false);
+      ok &= getJsonValue(r[F("ntp-poll-min")], ntpPollMin, (uint8_t)15);
       ok &= getJsonValue(r[F("trim-sec-day")], rtcTrim, (int16_t)0);
+      ok &= getJsonValue(r[F("trim-auto")], trimAuto, true);
       ok &= getJsonValue(r[F("reread-on")], rereadOn, true);
       ok &= getJsonValue(r[F("reread-min")], rereadMin, (uint8_t)2);
       ok &= getJsonValue(r[F("battery-check")], battCheck, true);
@@ -1433,8 +1506,8 @@ class UsermodAshishClock7Seg : public Usermod {
       chimeStart %= 24; chimeEnd %= 24;
       nightStart %= 24; nightEnd %= 24;
       rtcChip = rtcChip ? 1 : 0;
-      rtcMaster = rtcMaster ? 1 : 0;
-      rtcTrim = constrain(rtcTrim, -300, 300); trimAccMs = 0; trimLastMs = 0;
+      ntpPollMin = constrain(ntpPollMin, 5, 240);
+      rtcTrim = constrain(rtcTrim, -300, 300); trimSaved = rtcTrim; trimAccMs = 0; trimLastMs = 0;
       testMode = testMode > 3 ? 0 : testMode;
 
       configRead = true;
@@ -1461,7 +1534,6 @@ class UsermodAshishClock7Seg : public Usermod {
       C7_OAPPEND("c7d('alarm','days',['Every day','Mon-Fri','Sat-Sun']);");
       C7_OAPPEND("c7d('night','action',['Off','Dim','Keep on']);");
       C7_OAPPEND("c7d('rtc','chip',['DS1307','DS3231']);");
-      C7_OAPPEND("c7d('rtc','master',['Clock (RTC follows)','RTC (clock follows)']);");
       C7_OAPPEND("c7d('test','mode',['Off','All ON','Seg walk','Digit count']);");
       C7_OAPPEND("c7i('wiring','seg-order','Used if preset = Custom');");
       C7_OAPPEND("c7i('wiring','leds-per-colon','LEDs in ONE colon');");
@@ -1478,6 +1550,7 @@ class UsermodAshishClock7Seg : public Usermod {
       C7_OAPPEND("c7i('levels','all','0-255, 255 = full');");
       C7_OAPPEND("c7i('night','hide-seconds','6 digits only');");
       C7_OAPPEND("c7i('rtc','trim-sec-day','RTC gain s/day (+fast)');");
+      C7_OAPPEND("c7i('rtc','ntp-poll-min','5-240 min');");
     }
 
     uint16_t getId() { return USERMOD_ID_UNSPECIFIED; }
