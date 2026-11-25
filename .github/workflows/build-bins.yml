@@ -70,6 +70,19 @@ jobs:
               print("build number", m.group(1), "->", newv)
           else:
               print("WARNING: VERSION not found")
+          # ---- 2b) factory defaults: India time zone (IST), internet time (NTP) on, Indian NTP pool ----
+          try:
+              p = "wled00/wled.h"
+              s = open(p, encoding="utf-8").read()
+              s, n1 = re.subn(r"(currentTimezone\s+_INIT\()\d+(\))", r"\g<1>14\g<2>", s)          # 14 = IST (India)
+              s, n2 = re.subn(r"(ntpEnabled\s+_INIT\()false(\))", r"\g<1>true\g<2>", s)
+              s, n3 = re.subn(r'(ntpServerName\[\d+\]\s+_INIT\()"[^"]*"(\))', r'\g<1>"in.pool.ntp.org"\g<2>', s)
+              open(p, "w", encoding="utf-8").write(s)
+              print("defaults patched: timezone", n1, "ntp on", n2, "ntp server", n3)
+              if not (n1 and n3):
+                  print("WARNING: some factory defaults not found in wled.h (set time zone in Time & Macros after install)")
+          except Exception as e:
+              print("WARNING defaults patch:", e)
           # ---- 3) welcome page name ----
           try:
               p = "wled00/data/welcome.htm"
