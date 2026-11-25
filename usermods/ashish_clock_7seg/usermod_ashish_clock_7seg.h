@@ -41,7 +41,7 @@ class UsermodAshishClock7Seg : public Usermod {
     // ---------- settings ----------
     bool    enabled      = true;
     uint8_t mode         = 0;      // 0 = HH:MM:SS (6 digits), 1 = HH:MM (4 digits)
-    uint8_t hourFormat   = 0;      // 0 = 24H, 1 = 12H
+    uint8_t hourFormat   = 1;      // 0 = 24H, 1 = 12H (default 12H)
     bool    leadingZero  = true;
     bool    colonBlink   = true;
     uint8_t weekdayMode  = 1;      // 0 off, 1 today only, 2 all on (today highlighted)
@@ -59,7 +59,7 @@ class UsermodAshishClock7Seg : public Usermod {
     bool    blankExtra   = true;   // turn off LEDs after the clock chain
     uint8_t ampmLeds     = 1;      // 1..6 LEDs for AM, same for PM
 
-    bool    dateShow     = false;
+    bool    dateShow     = true;   // default: date is shown between the time
     uint8_t dateOrder    = 0;      // 0 = DD MM, 1 = MM DD
     uint8_t secTime      = 6;
     uint8_t secDayMonth  = 2;
@@ -161,7 +161,10 @@ class UsermodAshishClock7Seg : public Usermod {
     uint16_t rereadCount = 0;
     unsigned long ntpSeen = 0xFFFFFFFEUL, ntpOkAt = 0, ntpForceAt = 0, ntpTryAt = 0;   // internet time tracking
     bool     ntpEverOk = false, ntpForcing = false;
-    int16_t  trimSaved = 0;
+    // phone / browser time (used when there is no internet, e.g. phone connected to the clock's own AP)
+    unsigned long phoneHoldUntil = 0, phoneTryAt = 0, lastTotAt = 0;
+    bool     phonePending = false, lastTotValid = false;
+    int64_t  lastTotMs = 0;
     bool     syncMeasure = false;  // edge measurement only (compare RTC with fresh internet time), no clock change
     bool     errChecked  = true;   // RTC error vs internet already measured for this NTP sync
     bool     rtcErrValid = false, rtcSuggestValid = false;
@@ -861,7 +864,7 @@ class UsermodAshishClock7Seg : public Usermod {
             float w = (E >= 21600000UL) ? 1.0f : 0.5f;
             int nt = (int)lroundf((float)rtcTrim + w * perDay);
             nt = constrain(nt, -300, 300);
-            if (nt != rtcTrim) { rtcTrim = (int16_t)nt; if (nt != trimSaved) { trimSaved = (int16_t)nt; doSerializeConfig = true; } }
+            if (nt != rtcTrim) rtcTrim = (int16_t)nt;                 // kept until reboot; press Save on the Usermod page to keep it forever
           }
         }
         return;
@@ -908,6 +911,29 @@ class UsermodAshishClock7Seg : public Usermod {
       // internet time: ask every ntpPollMin minutes (WLED default is ~12 h) and track whether the server really answers
       ntpWatch(now);
 
+      // ---- PHONE / BROWSER TIME (only when there is NO internet time) ----
+      // The WLED page sends the phone's time with every command. The phone only knows whole seconds, so:
+      //  - clock already within 2 s of the phone (RTC aligned): keep the clock, ignore the phone (no +-1 s jitter)
+      //  - clock clearly wrong, or no RTC fitted: accept the phone time, copy it to the RTC, and pause the RTC alignment for 10 min
+      {
+        Toki::Time ct = toki.getTime();
+        int64_t cur = (int64_t)ct.sec * 1000 + ct.ms;
+        if (lastTotValid && toki.getTimeSource() == TOKI_TS_JSON && !ntpFresh()) {
+          int64_t expect = lastTotMs + (int64_t)(now - lastTotAt);
+          int64_t jump = cur - expect;
+          bool haveRtc = rtcEnabled && rtcReady;
+          if (haveRtc && jump > -2000 && jump < 2000) {            // phone adds nothing: undo the core's whole-second change
+            Toki::Time e; e.sec = (uint32_t)(expect / 1000); e.ms = (uint16_t)(expect % 1000);
+            toki.setTime(e, TOKI_TS_RTC); updateLocalTime();
+            cur = expect;
+          } else {                                                 // phone time wins
+            toki.setTime(toki.getTime(), TOKI_TS_RTC);             // mark as handled
+            if (haveRtc) { phoneHoldUntil = now + 600000UL; phonePending = true; }
+          }
+        }
+        lastTotMs = cur; lastTotAt = now; lastTotValid = true;
+      }
+
       // temperature sensor (every 10 s)
       if (now - lastTemp > 10000) {
         lastTemp = now;
@@ -943,7 +969,18 @@ class UsermodAshishClock7Seg : public Usermod {
         // (accuracy about 0.02 s, RTC drift trim included). Only moved when 0.1 s or more off.
         // This runs the whole time the internet is gone, so the ESP's own crystal drift can never pile up.
         // (freeRun = old mode: aligned only once after power on)
-        if (rereadOn && !online && syncState == 0 && (!freeRun || !bootAligned) && now - lastReread >= (unsigned long)rereadMin * 60000UL) {
+        bool phoneHold = phoneHoldUntil && (long)(phoneHoldUntil - now) > 0;     // phone time was just accepted: keep it for a while
+        if (online) phonePending = false;
+        if (phonePending && syncState == 0 && now - phoneTryAt > 3000UL && (toki.isTick() || toki.getTime().ms < 40)) {
+          phoneTryAt = now;                                        // copy the phone time to the RTC right at a second change
+          bool ok = false;
+          if (rtcWrite(toki.second())) {
+            time_t chk; delay(3);
+            if (rtcRead(chk)) { int32_t d = (int32_t)((uint32_t)chk - (uint32_t)toki.second()); ok = (d >= -2 && d <= 2); }
+          }
+          if (ok) { phonePending = false; rtcWritten = true; lastRtcWrite = now; trimAccMs = 0; trimLastMs = now; }
+        }
+        if (rereadOn && !online && !phoneHold && !phonePending && syncState == 0 && (!freeRun || !bootAligned) && now - lastReread >= (unsigned long)rereadMin * 60000UL) {
           lastReread = now;
           time_t rt;
           if (rtcRead(rt)) { syncBase = rt; syncState = 1; syncStart = now; syncPollAt = now; }
@@ -1150,23 +1187,6 @@ class UsermodAshishClock7Seg : public Usermod {
         a5e.add(String(be));
       }
 
-      // 5c) RTC battery / time warning
-      JsonArray a5c = user.createNestedArray(F("Clock RTC battery"));
-      if (!battCheck) a5c.add(F("check is OFF"));
-      else if (!rtcEnabled || !rtcReady) a5c.add(F("n/a"));
-      else if (rtcWarn) a5c.add(F("WARNING: time lost - replace CR2032 / set time"));
-      else a5c.add(F("OK (time valid)"));
-
-      // 5d) Countdown / stopwatch
-      JsonArray a5d = user.createNestedArray(F("Clock timer"));
-      if (timerMode == 0) a5d.add(F("off (double press button)"));
-      else {
-        uint32_t el = timerElapsedSec();
-        uint32_t val = (timerMode == 1) ? (((uint32_t)cdMin * 60UL > el) ? (uint32_t)cdMin * 60UL - el : 0) : el;
-        snprintf(b, sizeof(b), "%s %02d:%02d:%02d %s", timerMode == 1 ? "countdown" : "stopwatch", (int)(val / 3600), (int)((val / 60) % 60), (int)(val % 60), timerDone ? "DONE" : (timerRunning ? "running" : "paused"));
-        a5d.add(String(b));
-      }
-
       // 6) Temperature
       JsonArray a6 = user.createNestedArray(F("Clock temperature"));
       if (tempSource == 1) {
@@ -1194,14 +1214,6 @@ class UsermodAshishClock7Seg : public Usermod {
       JsonArray a8 = user.createNestedArray(F("Clock LEDs needed"));
       a8.add(ledsNeeded() + firstLed);
       a8.add(strip.getLengthTotal() >= ledsNeeded() + firstLed ? F(" (strip OK)") : F(" - raise LED count in LED Preferences!"));
-      {
-        uint16_t maxNeed = firstLed + 6 * 7 * ledsPerSeg + 2 * colonLeds + 7 * ledsPerDay + (ampmOn ? 2 * ampmLeds : 0);
-        JsonArray a8b = user.createNestedArray(F("Clock LEDs max"));
-        snprintf(b, sizeof(b), "%d", (int)maxNeed);
-        a8b.add(String(b));
-        a8b.add(F(" (6 digits). Set this as LED count to switch modes freely"));
-      }
-
       if (orderBad) { JsonArray a9 = user.createNestedArray(F("Clock seg order")); a9.add(F("invalid - using FABGEDC")); }
     }
 
@@ -1381,7 +1393,7 @@ class UsermodAshishClock7Seg : public Usermod {
 
       JsonObject d = top[F("display")];
       ok &= getJsonValue(d[F("mode")], mode, (uint8_t)0);
-      ok &= getJsonValue(d[F("hour-format")], hourFormat, (uint8_t)0);
+      ok &= getJsonValue(d[F("hour-format")], hourFormat, (uint8_t)1);
       ok &= getJsonValue(d[F("leading-zero")], leadingZero, true);
       ok &= getJsonValue(d[F("colon-blink")], colonBlink, true);
       ok &= getJsonValue(d[F("weekday-mode")], weekdayMode, (uint8_t)1);
@@ -1389,7 +1401,7 @@ class UsermodAshishClock7Seg : public Usermod {
       ok &= getJsonValue(d[F("startup-test")], startupTest, false);
 
       JsonObject dt = top[F("date")];
-      ok &= getJsonValue(dt[F("show")], dateShow, false);
+      ok &= getJsonValue(dt[F("show")], dateShow, true);
       ok &= getJsonValue(dt[F("order")], dateOrder, (uint8_t)0);
       ok &= getJsonValue(dt[F("time-sec")], secTime, (uint8_t)6);
       ok &= getJsonValue(dt[F("day-month-sec")], secDayMonth, (uint8_t)2);
@@ -1507,7 +1519,7 @@ class UsermodAshishClock7Seg : public Usermod {
       nightStart %= 24; nightEnd %= 24;
       rtcChip = rtcChip ? 1 : 0;
       ntpPollMin = constrain(ntpPollMin, 5, 240);
-      rtcTrim = constrain(rtcTrim, -300, 300); trimSaved = rtcTrim; trimAccMs = 0; trimLastMs = 0;
+      rtcTrim = constrain(rtcTrim, -300, 300); trimAccMs = 0; trimLastMs = 0;
       testMode = testMode > 3 ? 0 : testMode;
 
       configRead = true;
